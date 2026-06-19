@@ -12,6 +12,7 @@ pub enum RuffleEvent {
         down: bool,
         key_descriptor: KeyDescriptor,
     },
+    TextInput(String),
     RunContextMenuCallback(usize),
     ClearContextMenu,
     RequestContextMenu,

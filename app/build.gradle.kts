@@ -4,19 +4,20 @@ import com.android.build.api.variant.FilterConfiguration.FilterType.ABI
 import com.android.build.gradle.internal.cxx.configure.gradleLocalProperties
 import com.github.willir.rust.CargoNdkBuildTask
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.konan.properties.hasProperty
-import org.jetbrains.kotlin.konan.properties.propertyList
 
 val localProperties = gradleLocalProperties(rootDir, providers)
 val abiFilterList = ((localProperties["ABI_FILTERS"] ?: properties["ABI_FILTERS"]) as? String)
     ?.split(';')
+val ndkTargetList = ((localProperties["ndkTargets"] ?: properties["ndkTargets"]) as? String)
+    ?.split(';')
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
 val abiCodes = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86" to 3, "x86_64" to 4)
 
 plugins {
     alias(libs.plugins.androidApplication)
     alias(libs.plugins.jetbrainsKotlinAndroid)
     alias(libs.plugins.cargoNdkAndroid)
-    alias(libs.plugins.composeCompiler)
 }
 
 android {
@@ -27,8 +28,8 @@ android {
         applicationId = "rs.ruffle"
         minSdk = 26
         targetSdk = 35
-        versionCode = 260615
-        versionName = "0.260615"
+        versionCode = 1104
+        versionName = "1.1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -72,7 +73,6 @@ android {
     }
 
     buildFeatures {
-        compose = true
         prefab = true
     }
 
@@ -129,16 +129,6 @@ androidComponents {
 dependencies {
 
     implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.lifecycle.runtime.ktx)
-    implementation(libs.androidx.activity.compose)
-    implementation(platform(libs.androidx.compose.bom))
-    implementation(libs.androidx.ui)
-    implementation(libs.androidx.ui.graphics)
-    implementation(libs.androidx.ui.tooling.preview)
-    implementation(libs.androidx.material3)
-    implementation(libs.androidx.lifecycle.viewmodel.compose)
-    implementation(libs.androidx.navigation.runtime.ktx)
-    implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.games.activity)
     implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.appcompat)
@@ -148,10 +138,6 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(platform(libs.androidx.compose.bom))
-    androidTestImplementation(libs.androidx.ui.test.junit4)
-    debugImplementation(libs.androidx.ui.tooling)
-    debugImplementation(libs.androidx.ui.test.manifest)
 }
 
 // On GHA, we prebuild the native libs separately for fasterness,
@@ -167,7 +153,7 @@ cargoNdk {
     apiLevel = 26
     buildType = "release"
 
-    if (localProperties.hasProperty("ndkTargets")) {
-        targets = ArrayList(localProperties.propertyList("ndkTargets"))
+    if (!ndkTargetList.isNullOrEmpty()) {
+        targets = ArrayList(ndkTargetList)
     }
 }

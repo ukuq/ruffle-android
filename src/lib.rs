@@ -3,7 +3,9 @@ mod custom_event;
 mod java;
 mod keycodes;
 mod navigator;
+mod seer2;
 mod trace;
+mod ui;
 
 use custom_event::RuffleEvent;
 
@@ -38,8 +40,8 @@ use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
     backend::navigator::OwnedFuture,
     events::{LogicalKey, MouseButton, PlayerEvent},
-    tag_utils::SwfMovie,
-    Player, PlayerBuilder, ViewportDimensions,
+    font::DefaultFont,
+    Player, PlayerBuilder, StageAlign, StageScaleMode, ViewportDimensions,
 };
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
 use ruffle_frontend_utils::content::PlayingContent;
@@ -50,6 +52,7 @@ use ruffle_frontend_utils::{
 
 use crate::navigator::AndroidNavigatorInterface;
 use crate::trace::FileLogBackend;
+use crate::ui::AndroidUiBackend;
 use java::JavaInterface;
 use ruffle_render_wgpu::{backend::WgpuRenderBackend, target::SwapChainTarget};
 
@@ -77,6 +80,39 @@ pub struct PlayerRunnable(async_task::Runnable<PlayerId>);
 struct ActivePlayer {
     id: PlayerId,
     player: Arc<Mutex<Player>>,
+}
+
+#[derive(Clone, Copy)]
+enum RenderBackendPreference {
+    Auto,
+    Vulkan,
+    OpenGl,
+}
+
+impl RenderBackendPreference {
+    fn from_key(key: &str) -> Self {
+        match key {
+            "auto" => Self::Auto,
+            "opengl" => Self::OpenGl,
+            _ => Self::Vulkan,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Vulkan => "vulkan",
+            Self::OpenGl => "opengl",
+        }
+    }
+
+    fn backends(self) -> wgpu::Backends {
+        match self {
+            Self::Auto => wgpu::Backends::PRIMARY,
+            Self::Vulkan => wgpu::Backends::VULKAN,
+            Self::OpenGl => wgpu::Backends::GL,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -141,6 +177,8 @@ async fn run(app: AndroidApp) {
     log::info!("Starting event loop...");
     let trace_output;
     let android_storage_dir;
+    let android_app_data_dir;
+    let render_backend;
 
     unsafe {
         let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut sys::JavaVM).expect("JVM must exist");
@@ -148,7 +186,34 @@ async fn run(app: AndroidApp) {
         let mut jni_env = vm.get_env().unwrap();
         trace_output = JavaInterface::get_trace_output(&mut jni_env, &activity);
         android_storage_dir = JavaInterface::get_android_data_storage_dir(&mut jni_env, &activity);
+        android_app_data_dir = JavaInterface::get_android_app_data_dir(&mut jni_env, &activity);
+        render_backend = RenderBackendPreference::from_key(&JavaInterface::get_render_backend(
+            &mut jni_env,
+            &activity,
+        ));
         let _ = jni_env.set_rust_field(activity, "eventLoopHandle", sender.clone());
+    }
+    log::info!("Render backend preference: {}", render_backend.key());
+
+    let load_failure_notifier: seer2::LoadFailureNotifier =
+        Arc::new(|message| show_load_failure(&message));
+    let seer2_server = match seer2::HttpServer::start(
+        android_app_data_dir,
+        Some(load_failure_notifier),
+    ) {
+        Ok(server) => Some(server),
+        Err(err) => {
+            let message = format!(
+                "\u{6e38}\u{620f}\u{52a0}\u{8f7d}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{540e}\u{91cd}\u{8bd5}\u{3002}\n{}",
+                err
+            );
+            log::error!("Failed to start Seer2 local server: {}", err);
+            show_load_failure(&message);
+            None
+        }
+    };
+    if let Some(server) = seer2_server.as_ref() {
+        start_server_metrics_overlay(server.metrics());
     }
 
     while !quit {
@@ -274,7 +339,7 @@ async fn run(app: AndroidApp) {
                                     .unwrap();
                                 }
                                 player_lock.set_is_playing(true);
-                            } else {
+                            } else if let Some(seer2_server) = seer2_server.as_ref() {
                                 let renderer = unsafe {
                                     // TODO: make this take an Arc<Window> instead?
                                     WgpuRenderBackend::for_window_unsafe(
@@ -288,12 +353,12 @@ async fn run(app: AndroidApp) {
                                                 .into(),
                                         },
                                         (dimensions.width, dimensions.height),
-                                        wgpu::Backends::GL,
+                                        render_backend.backends(),
                                         wgpu::PowerPreference::HighPerformance,
                                     )
                                     .unwrap()
                                 };
-                                let movie_url = Url::parse("file://movie.swf").unwrap();
+                                let movie_url = Url::parse(&seer2_server.movie_url()).unwrap();
                                 let player_id = PlayerId::new();
 
                                 let future_spawner = AndroidExecutor {
@@ -307,10 +372,12 @@ async fn run(app: AndroidApp) {
                                     None,
                                     future_spawner,
                                     None,
-                                    true,
+                                    false,
                                     Default::default(),
                                     ruffle_core::backend::navigator::SocketMode::Allow,
-                                    Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(movie_url))),
+                                    Rc::new(PlayingContent::DirectFile(
+                                        ContentDescriptor::new_remote(movie_url.clone()),
+                                    )),
                                     AndroidNavigatorInterface,
                                 );
 
@@ -320,30 +387,28 @@ async fn run(app: AndroidApp) {
                                             .with_renderer(renderer)
                                             .with_audio(AAudioAudioBackend::new().unwrap())
                                             .with_storage(Box::new(DiskStorageBackend::new(android_storage_dir.clone())))
+                                            .with_ui(AndroidUiBackend::new())
                                             .with_navigator(navigator)
                                             .with_log(FileLogBackend::new(trace_output.as_deref()))
                                             .with_video(
                                                 ruffle_video_software::backend::SoftwareVideoBackend::new(),
                                             )
+                                            .with_letterbox(ruffle_core::config::Letterbox::On)
+                                            .with_align(StageAlign::empty(), true)
+                                            .with_scale_mode(StageScaleMode::ShowAll, true)
+                                            .with_fullscreen(true)
                                         .build(),
                                     }
                                 );
 
                                 let player = &playerbox.as_ref().unwrap().player;
                                 let mut player_lock = player.lock().unwrap();
-                                let (jvm, activity) = get_jvm().unwrap();
-                                let mut env = jvm.attach_current_thread().unwrap();
-                                let url = JavaInterface::get_swf_uri(&mut env, &activity);
-                                let bytes = JavaInterface::get_swf_bytes(&mut env, &activity);
-
-                                if let Some(bytes) = bytes {
-                                    let movie = SwfMovie::from_data(&bytes, url, None).unwrap();
-                                    player_lock.mutate_with_update_context(|context| {
-                                        context.set_root_movie(movie);
-                                    });
-                                } else {
-                                    player_lock.fetch_root_movie(url, Vec::new(), Box::new(|_| {}))
-                                }
+                                set_android_default_fonts(&mut player_lock);
+                                player_lock.fetch_root_movie(
+                                    movie_url.to_string(),
+                                    Vec::new(),
+                                    Box::new(|_| {}),
+                                );
                                 player_lock.set_is_playing(true); // Desktop player will auto-play.
 
                                 player_lock.set_letterbox(ruffle_core::config::Letterbox::On);
@@ -354,6 +419,8 @@ async fn run(app: AndroidApp) {
                                 next_frame_time = Some(Instant::now());
 
                                 log::info!("MOVIE STARTED");
+                            } else {
+                                log::warn!("Seer2 local server is unavailable; player not started");
                             }
                         }
                         MainEvent::TerminateWindow { .. }  => {
@@ -495,6 +562,14 @@ async fn run(app: AndroidApp) {
                     }
                 }
             }
+            Ok(RuffleEvent::TextInput(text)) => {
+                if let Some(player) = playerbox.as_ref() {
+                    let mut player = player.player.lock().unwrap();
+                    for codepoint in text.chars() {
+                        player.handle_event(PlayerEvent::TextInput { codepoint });
+                    }
+                }
+            }
             Ok(RuffleEvent::RunContextMenuCallback(index)) => {
                 if let Some(player) = playerbox.as_ref() {
                     player
@@ -560,6 +635,27 @@ async fn run(app: AndroidApp) {
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_commitText(
+    mut env: JNIEnv,
+    this: JObject,
+    text: JString,
+) {
+    let text: String = env
+        .get_string(&text)
+        .expect("Couldn't get java string!")
+        .into();
+
+    if text.is_empty() {
+        return;
+    }
+
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let _ = event_loop.send(RuffleEvent::TextInput(text));
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydown(
     mut env: JNIEnv,
     this: JObject,
@@ -609,6 +705,55 @@ pub fn get_jvm<'a>() -> Result<(jni::JavaVM, JObject<'a>), Box<dyn std::error::E
     let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }?;
 
     Ok((vm, activity))
+}
+
+fn show_load_failure(message: &str) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => JavaInterface::show_load_failure(&mut env, &activity, message),
+            Err(err) => log::error!("Failed to attach JVM for load failure dialog: {}", err),
+        },
+        Err(err) => log::error!("Failed to get JVM for load failure dialog: {}", err),
+    }
+}
+
+fn start_server_metrics_overlay(metrics: Arc<seer2::CacheMetrics>) {
+    thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            let text = metrics.snapshot_text();
+            if text != last {
+                update_server_metrics(&text);
+                last = text;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+fn update_server_metrics(text: &str) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => JavaInterface::update_server_metrics(&mut env, &activity, text),
+            Err(err) => log::error!("Failed to attach JVM for server metrics: {}", err),
+        },
+        Err(err) => log::error!("Failed to get JVM for server metrics: {}", err),
+    }
+}
+
+fn set_android_default_fonts(player: &mut Player) {
+    let names = vec![
+        "Android CJK".to_string(),
+        "宋体".to_string(),
+        "SimSun".to_string(),
+        "Arial".to_string(),
+    ];
+    player.set_default_font(DefaultFont::Sans, names.clone());
+    player.set_default_font(DefaultFont::Serif, names.clone());
+    player.set_default_font(DefaultFont::Typewriter, names.clone());
+    player.set_default_font(DefaultFont::JapaneseGothic, names.clone());
+    player.set_default_font(DefaultFont::JapaneseGothicMono, names.clone());
+    player.set_default_font(DefaultFont::JapaneseMincho, names);
 }
 
 #[no_mangle]

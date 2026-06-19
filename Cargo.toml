@@ -1,7 +1,7 @@
 [package]
 # Underscore because the cargo-ndk gradle plugin doesn't transform a hyphen to it.
 name = "ruffle_android"
-version = "0.1.0"
+version = "1.1.4"
 authors = [
     "Ruffle contributors <ruffle@ruffle.rs>",
     "TÖRÖK Attila <torokati44@gmail.com>",
@@ -29,8 +29,8 @@ ndk-context = "0.1.1"
 # Have to follow Ruffle with this.
 wgpu = "27.0.1"
 
-ruffle_common = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
-ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master", features = [
+ruffle_common = { path = "../ruffle/core/common" }
+ruffle_core = { path = "../ruffle/core", features = [
     "audio",
     "symphonia",
     "mp3",
@@ -39,9 +39,9 @@ ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "maste
     "default_compatibility_rules",
     "default_font",
 ] }
-ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
-ruffle_video_software = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
-ruffle_frontend_utils = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master", default-features = false, features = ["fs", "navigator", "rustls-tls"] }
+ruffle_render_wgpu = { path = "../ruffle/render/wgpu" }
+ruffle_video_software = { path = "../ruffle/video/software" }
+ruffle_frontend_utils = { path = "../ruffle/frontend-utils", default-features = false, features = ["fs", "navigator", "rustls-tls"] }
 
 log = "0.4.32"
 
@@ -54,10 +54,11 @@ url = "2.5.2"
 webbrowser = "1.1.0"
 
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"]}
+base64 = "0.22.1"
 
 [features]
 jpegxr = ["ruffle_core/jpegxr"]
 
 # so Rascal doesn't pull in another copy of swf from crates.io
 [patch.crates-io]
-swf = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
+swf = { path = "../ruffle/swf" }

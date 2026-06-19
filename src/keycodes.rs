@@ -360,6 +360,16 @@ pub fn key_tag_to_key_descriptor(tag: &str) -> Option<KeyDescriptor> {
             logical_key: LogicalKey::Character(' '),
             key_location: KeyLocation::Standard,
         }),
+        "BACKSPACE" => Some(KeyDescriptor {
+            physical_key: PhysicalKey::Backspace,
+            logical_key: LogicalKey::Named(NamedKey::Backspace),
+            key_location: KeyLocation::Standard,
+        }),
+        "ENTER" => Some(KeyDescriptor {
+            physical_key: PhysicalKey::Enter,
+            logical_key: LogicalKey::Named(NamedKey::Enter),
+            key_location: KeyLocation::Standard,
+        }),
         "ALT" => Some(KeyDescriptor {
             physical_key: PhysicalKey::AltLeft,
             logical_key: LogicalKey::Named(NamedKey::Alt),

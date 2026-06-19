@@ -1,20 +1,43 @@
 package rs.ruffle
 
+import android.app.Activity
 import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import rs.ruffle.ui.theme.RuffleTheme
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
 
-class PanicActivity : ComponentActivity() {
+class PanicActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        setContent {
-            RuffleTheme {
-                PanicScreen(message = intent.getStringExtra("message") ?: "Unknown")
-            }
+        val message = intent.getStringExtra("message") ?: "Unknown"
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 32, 32, 32)
         }
+        container.addView(
+            TextView(this).apply {
+                text = "Ruffle Panicked"
+                textSize = 24f
+            }
+        )
+        container.addView(
+            ScrollView(this).apply {
+                addView(
+                    TextView(this@PanicActivity).apply {
+                        text = message
+                        setTextIsSelectable(true)
+                        textSize = 12f
+                    }
+                )
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+
+        setContentView(container)
     }
 }
