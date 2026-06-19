@@ -1,6 +1,4 @@
-use jni::objects::{
-    JByteArray, JClass, JIntArray, JMethodID, JObject, JString, JValue, ReleaseMode,
-};
+use jni::objects::{JClass, JIntArray, JMethodID, JObject, JString, JValue, ReleaseMode};
 use jni::signature::{Primitive, ReturnType};
 use jni::JNIEnv;
 use ruffle_core::ContextMenuItem;
@@ -15,11 +13,12 @@ pub struct JavaInterface {
     get_surface_width: JMethodID,
     get_surface_height: JMethodID,
     show_context_menu: JMethodID,
-    get_swf_bytes: JMethodID,
-    get_swf_uri: JMethodID,
     get_trace_output: JMethodID,
     get_loc_in_window: JMethodID,
     get_android_data_storage_dir: JMethodID,
+    get_android_app_data_dir: JMethodID,
+    show_virtual_keyboard: JMethodID,
+    hide_virtual_keyboard: JMethodID,
 }
 
 static JAVA_INTERFACE: OnceLock<JavaInterface> = OnceLock::new();
@@ -79,39 +78,6 @@ impl JavaInterface {
         result.expect("showContextMenu() must never throw");
     }
 
-    pub fn get_swf_bytes(env: &mut JNIEnv, this: &JObject) -> Option<Vec<u8>> {
-        let result = unsafe {
-            env.call_method_unchecked(this, Self::get().get_swf_bytes, ReturnType::Array, &[])
-        };
-        let object = result.expect("getSwfBytes() must never throw").l().unwrap();
-        if object.is_null() {
-            return None;
-        }
-
-        let arr = JByteArray::from(object);
-        let elements = unsafe {
-            env.get_array_elements(&arr, ReleaseMode::NoCopyBack)
-                .unwrap()
-        };
-        let data =
-            unsafe { std::slice::from_raw_parts(elements.as_ptr() as *mut u8, elements.len()) };
-        Some(data.to_vec())
-    }
-
-    pub fn get_swf_uri(env: &mut JNIEnv, this: &JObject) -> String {
-        let result = unsafe {
-            env.call_method_unchecked(this, Self::get().get_swf_uri, ReturnType::Object, &[])
-        };
-        let object = result.expect("getSwfUri() must never throw").l().unwrap();
-        if object.is_null() {
-            return Default::default();
-        }
-        let string_object = JString::from(object);
-        let java_string = unsafe { env.get_string_unchecked(&string_object) };
-        let url = java_string.unwrap().to_string_lossy().to_string();
-        url
-    }
-
     pub fn get_trace_output(env: &mut JNIEnv, this: &JObject) -> Option<PathBuf> {
         let result = unsafe {
             env.call_method_unchecked(this, Self::get().get_trace_output, ReturnType::Object, &[])
@@ -165,6 +131,83 @@ impl JavaInterface {
         PathBuf::from(path)
     }
 
+    pub fn get_android_app_data_dir(env: &mut JNIEnv, this: &JObject) -> PathBuf {
+        let result = unsafe {
+            env.call_method_unchecked(
+                this,
+                Self::get().get_android_app_data_dir,
+                ReturnType::Object,
+                &[],
+            )
+        };
+        let object = result
+            .expect("getAndroidAppDataDir() must never throw")
+            .l()
+            .unwrap();
+        let string_object = JString::from(object);
+        let java_string = unsafe { env.get_string_unchecked(&string_object) };
+        let path = java_string.unwrap().to_string_lossy().to_string();
+        PathBuf::from(path)
+    }
+
+    pub fn get_render_backend(env: &mut JNIEnv, this: &JObject) -> String {
+        let result = env.call_method(this, "getRenderBackend", "()Ljava/lang/String;", &[]);
+        let object = result
+            .expect("getRenderBackend() must never throw")
+            .l()
+            .unwrap();
+        let string_object = JString::from(object);
+        let java_string = unsafe { env.get_string_unchecked(&string_object) };
+        let backend = java_string.unwrap().to_string_lossy().to_string();
+        backend
+    }
+
+    pub fn show_load_failure(env: &mut JNIEnv, this: &JObject, message: &str) {
+        let java_message = env.new_string(message).unwrap();
+        let result = env.call_method(
+            this,
+            "showLoadFailureAndExit",
+            "(Ljava/lang/String;)V",
+            &[(&java_message).into()],
+        );
+        result.expect("showLoadFailureAndExit() must never throw");
+    }
+
+    pub fn show_virtual_keyboard(env: &mut JNIEnv, this: &JObject) {
+        let result = unsafe {
+            env.call_method_unchecked(
+                this,
+                Self::get().show_virtual_keyboard,
+                ReturnType::Primitive(Primitive::Void),
+                &[],
+            )
+        };
+        result.expect("showVirtualKeyboard() must never throw");
+    }
+
+    pub fn hide_virtual_keyboard(env: &mut JNIEnv, this: &JObject) {
+        let result = unsafe {
+            env.call_method_unchecked(
+                this,
+                Self::get().hide_virtual_keyboard,
+                ReturnType::Primitive(Primitive::Void),
+                &[],
+            )
+        };
+        result.expect("hideVirtualKeyboard() must never throw");
+    }
+
+    pub fn update_server_metrics(env: &mut JNIEnv, this: &JObject, text: &str) {
+        let java_text = env.new_string(text).unwrap();
+        let result = env.call_method(
+            this,
+            "updateServerMetrics",
+            "(Ljava/lang/String;)V",
+            &[(&java_text).into()],
+        );
+        result.expect("updateServerMetrics() must never throw");
+    }
+
     pub fn get() -> &'static JavaInterface {
         JAVA_INTERFACE
             .get()
@@ -182,12 +225,6 @@ impl JavaInterface {
             show_context_menu: env
                 .get_method_id(class, "showContextMenu", "([Ljava/lang/String;)V")
                 .expect("showContextMenu must exist"),
-            get_swf_bytes: env
-                .get_method_id(class, "getSwfBytes", "()[B")
-                .expect("getSwfBytes must exist"),
-            get_swf_uri: env
-                .get_method_id(class, "getSwfUri", "()Ljava/lang/String;")
-                .expect("getSwfUri must exist"),
             get_trace_output: env
                 .get_method_id(class, "getTraceOutput", "()Ljava/lang/String;")
                 .expect("getTraceOutput must exist"),
@@ -197,6 +234,15 @@ impl JavaInterface {
             get_android_data_storage_dir: env
                 .get_method_id(class, "getAndroidDataStorageDir", "()Ljava/lang/String;")
                 .expect("getAndroidDataStorageDir must exist"),
+            get_android_app_data_dir: env
+                .get_method_id(class, "getAndroidAppDataDir", "()Ljava/lang/String;")
+                .expect("getAndroidAppDataDir must exist"),
+            show_virtual_keyboard: env
+                .get_method_id(class, "showVirtualKeyboard", "()V")
+                .expect("showVirtualKeyboard must exist"),
+            hide_virtual_keyboard: env
+                .get_method_id(class, "hideVirtualKeyboard", "()V")
+                .expect("hideVirtualKeyboard must exist"),
         });
     }
 }
