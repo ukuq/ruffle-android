@@ -202,7 +202,7 @@ where
 }
 
 struct ActivePlayerConfig<'a> {
-    server: &'a seer2::HttpServer,
+    movie_url: &'a str,
     event_loop: EventSender,
     android_storage_dir: &'a Path,
     trace_output: Option<&'a Path>,
@@ -217,7 +217,7 @@ fn create_active_player(
     config: ActivePlayerConfig<'_>,
 ) -> Result<ActivePlayer, String> {
     let ActivePlayerConfig {
-        server,
+        movie_url,
         event_loop,
         android_storage_dir,
         trace_output,
@@ -227,7 +227,7 @@ fn create_active_player(
     } = config;
     let dimensions = viewport_dimensions_for_backend(app, window, render_backend, render_scale);
     let renderer = create_render_backend(window, dimensions, render_backend)?;
-    let movie_url = server.movie_url();
+    let movie_url = movie_url.to_owned();
     let movie_url_parsed =
         Url::parse(&movie_url).map_err(|error| format!("Invalid movie URL: {error}"))?;
     let player_id = PlayerId::new();
@@ -521,6 +521,7 @@ async fn run(app: AndroidApp) {
 
     log::info!("Starting event loop...");
     let trace_output;
+    let swf_uri;
     let android_storage_dir;
     let android_app_data_dir;
     let render_backend;
@@ -532,6 +533,7 @@ async fn run(app: AndroidApp) {
         let activity = JObject::from_raw(app.activity_as_ptr() as jobject);
         let mut jni_env = vm.get_env().unwrap();
         trace_output = JavaInterface::get_trace_output(&mut jni_env, &activity);
+        swf_uri = JavaInterface::get_swf_uri(&mut jni_env, &activity);
         android_storage_dir = JavaInterface::get_android_data_storage_dir(&mut jni_env, &activity);
         android_app_data_dir = JavaInterface::get_android_app_data_dir(&mut jni_env, &activity);
         render_backend = RenderBackendPreference::from_key(&JavaInterface::get_render_backend(
@@ -553,23 +555,30 @@ async fn run(app: AndroidApp) {
     }
     log::info!("Stage quality: {stage_quality}");
 
-    let load_failure_notifier: seer2::LoadFailureNotifier =
-        Arc::new(|message| show_load_failure(&message));
-    let seer2_server = match seer2::HttpServer::start(
-        android_app_data_dir,
-        Some(load_failure_notifier),
-    ) {
-        Ok(server) => Some(server),
-        Err(err) => {
-            let message = format!(
-                "\u{6e38}\u{620f}\u{52a0}\u{8f7d}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{540e}\u{91cd}\u{8bd5}\u{3002}\n{}",
-                err
-            );
-            log::error!("Failed to start Seer2 local server: {}", err);
-            show_load_failure(&message);
-            None
+    let external_movie_url = swf_uri.filter(|uri| !uri.is_empty());
+    if let Some(uri) = external_movie_url.as_ref() {
+        log::info!("Loading movie from Android intent: {uri}");
+    }
+    let seer2_server = if external_movie_url.is_some() {
+        None
+    } else {
+        let load_failure_notifier: seer2::LoadFailureNotifier =
+            Arc::new(|message| show_load_failure(&message));
+        match seer2::HttpServer::start(android_app_data_dir, Some(load_failure_notifier)) {
+            Ok(server) => Some(server),
+            Err(err) => {
+                let message = format!(
+                    "\u{6e38}\u{620f}\u{52a0}\u{8f7d}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{540e}\u{91cd}\u{8bd5}\u{3002}\n{}",
+                    err
+                );
+                log::error!("Failed to start Seer2 local server: {}", err);
+                show_load_failure(&message);
+                None
+            }
         }
     };
+    let root_movie_url =
+        external_movie_url.or_else(|| seer2_server.as_ref().map(|server| server.movie_url()));
     if let Some(server) = seer2_server.as_ref() {
         start_server_metrics_overlay(server.metrics());
     }
@@ -677,12 +686,12 @@ async fn run(app: AndroidApp) {
                             if app_resumed {
                                 set_audio_output(activeplayer, true);
                             }
-                        } else if let Some(seer2_server) = seer2_server.as_ref() {
+                        } else if let Some(movie_url) = root_movie_url.as_ref() {
                             match create_active_player(
                                 &app,
                                 window,
                                 ActivePlayerConfig {
-                                    server: seer2_server,
+                                    movie_url,
                                     event_loop: sender.clone(),
                                     android_storage_dir: &android_storage_dir,
                                     trace_output: trace_output.as_deref(),
@@ -706,7 +715,7 @@ async fn run(app: AndroidApp) {
                                 }
                             }
                         } else {
-                            log::warn!("Seer2 local server is unavailable; player not started");
+                            log::warn!("Root movie URL is unavailable; player not started");
                         }
                     }
                     MainEvent::TerminateWindow { .. } => {
@@ -958,14 +967,13 @@ async fn run(app: AndroidApp) {
                     }
                 }
                 RuffleEvent::ReloadMovie => {
-                    if let (Some(player), Some(server)) =
-                        (playerbox.as_ref(), seer2_server.as_ref())
+                    if let (Some(player), Some(movie_url)) =
+                        (playerbox.as_ref(), root_movie_url.as_ref())
                     {
                         log::info!("Replacing root Flash movie");
-                        let movie_url = server.movie_url();
                         if let Ok(mut player) = player.player.lock() {
                             player.mutate_with_update_context(|uc| {
-                                let future = load_replacement_root_movie(uc, movie_url);
+                                let future = load_replacement_root_movie(uc, movie_url.to_owned());
                                 uc.navigator.spawn_future(future);
                             });
                             needs_redraw = true;

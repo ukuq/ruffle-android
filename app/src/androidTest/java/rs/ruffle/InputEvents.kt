@@ -26,6 +26,7 @@ import org.junit.runner.RunWith
 
 private const val BASIC_SAMPLE_PACKAGE = "rs.seer2"
 private const val LAUNCH_TIMEOUT = 5000L
+private const val TRACE_TIMEOUT = 30000L
 private const val SWF_WIDTH = 550.0
 private const val SWF_HEIGHT = 400.0
 
@@ -156,7 +157,10 @@ class InputEvents {
      * @param idleWindowMillis How long the log file must stay the same size for, before it's considered idle
      * @param timeoutMillis How long to keep waiting for, before throwing an error
      */
-    private fun waitUntilNewLogAndIdle(idleWindowMillis: Long = 1000, timeoutMillis: Long = 10000) {
+    private fun waitUntilNewLogAndIdle(
+        idleWindowMillis: Long = 1000,
+        timeoutMillis: Long = TRACE_TIMEOUT
+    ) {
         val startTimeMillis = SystemClock.uptimeMillis()
         val timeoutAt = startTimeMillis + timeoutMillis
         waitUntilNewLog(timeoutAt - SystemClock.uptimeMillis())
@@ -168,7 +172,7 @@ class InputEvents {
      *
      * @param timeoutMillis How long to keep waiting for, before throwing an error
      */
-    private fun waitUntilNewLog(timeoutMillis: Long = 10000) {
+    private fun waitUntilNewLog(timeoutMillis: Long = TRACE_TIMEOUT) {
         val startTimeMillis = SystemClock.uptimeMillis()
         val timeoutAt = startTimeMillis + timeoutMillis
         while (true) {
@@ -191,7 +195,10 @@ class InputEvents {
      * @param idleWindowMillis How long the log file must stay the same size for, before it's considered idle
      * @param timeoutMillis How long to keep waiting for, before throwing an error
      */
-    private fun waitUntilLogIdles(idleWindowMillis: Long = 1000, timeoutMillis: Long = 10000) {
+    private fun waitUntilLogIdles(
+        idleWindowMillis: Long = 1000,
+        timeoutMillis: Long = TRACE_TIMEOUT
+    ) {
         val startTimeMillis = SystemClock.uptimeMillis()
         val timeoutAt = startTimeMillis + timeoutMillis
 

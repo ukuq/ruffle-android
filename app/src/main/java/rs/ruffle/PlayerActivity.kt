@@ -76,6 +76,13 @@ class PlayerActivity : GameActivity() {
             return intent.getStringExtra("traceOutput")
         }
 
+    @Suppress("unused")
+    // Used by Rust
+    private val swfUri: String?
+        get() {
+            return intent.dataString
+        }
+
     private var loc = IntArray(2)
 
     @Suppress("unused")

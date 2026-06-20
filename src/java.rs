@@ -14,6 +14,7 @@ pub struct JavaInterface {
     get_surface_height: JMethodID,
     show_context_menu: JMethodID,
     get_trace_output: JMethodID,
+    get_swf_uri: JMethodID,
     get_loc_in_window: JMethodID,
     get_android_data_storage_dir: JMethodID,
     get_android_app_data_dir: JMethodID,
@@ -93,6 +94,20 @@ impl JavaInterface {
         let java_string = unsafe { env.get_string_unchecked(&string_object) };
         let url = java_string.unwrap().to_string_lossy().to_string();
         Some(url.into())
+    }
+
+    pub fn get_swf_uri(env: &mut JNIEnv, this: &JObject) -> Option<String> {
+        let result = unsafe {
+            env.call_method_unchecked(this, Self::get().get_swf_uri, ReturnType::Object, &[])
+        };
+        let object = result.expect("getSwfUri() must never throw").l().unwrap();
+        if object.is_null() {
+            return None;
+        }
+        let string_object = JString::from(object);
+        let java_string = unsafe { env.get_string_unchecked(&string_object) };
+        let url = java_string.unwrap().to_string_lossy().to_string();
+        Some(url)
     }
 
     pub fn get_loc_in_window(env: &mut JNIEnv, this: &JObject) -> (i32, i32) {
@@ -258,6 +273,9 @@ impl JavaInterface {
             get_trace_output: env
                 .get_method_id(class, "getTraceOutput", "()Ljava/lang/String;")
                 .expect("getTraceOutput must exist"),
+            get_swf_uri: env
+                .get_method_id(class, "getSwfUri", "()Ljava/lang/String;")
+                .expect("getSwfUri must exist"),
             get_loc_in_window: env
                 .get_method_id(class, "getLocInWindow", "()[I")
                 .expect("getLocInWindow must exist"),
