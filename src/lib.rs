@@ -16,6 +16,7 @@ use jni::{
 };
 use keycodes::{android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor};
 use std::any::Any;
+use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
@@ -40,7 +41,7 @@ use url::Url;
 use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
     backend::navigator::{FetchReason, OwnedFuture, Request},
-    events::{LogicalKey, MouseButton, PlayerEvent},
+    events::{LogicalKey, MouseButton, PlayerEvent, TextControlCode},
     font::DefaultFont,
     tag_utils::SwfMovie,
     Player, PlayerBuilder, StageAlign, StageScaleMode, ViewportDimensions,
@@ -56,7 +57,12 @@ use crate::navigator::{AndroidNavigatorBackend, AndroidNavigatorInterface};
 use crate::trace::FileLogBackend;
 use crate::ui::AndroidUiBackend;
 use java::JavaInterface;
+use ruffle_render::quality::StageQuality;
 use ruffle_render_wgpu::{backend::WgpuRenderBackend, target::SwapChainTarget};
+
+thread_local! {
+    static SUPPRESS_PANIC_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
 
 /// A unique identifier for a given `Player` instance.
 /// Used to track which player any currently executing future is bound to.
@@ -84,7 +90,7 @@ struct ActivePlayer {
     player: Arc<Mutex<Player>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderBackendPreference {
     Auto,
     Vulkan,
@@ -114,6 +120,15 @@ impl RenderBackendPreference {
             Self::Vulkan => wgpu::Backends::VULKAN,
             Self::OpenGl => wgpu::Backends::GL,
         }
+    }
+}
+
+fn stage_quality_from_key(key: &str) -> StageQuality {
+    match key {
+        "low" => StageQuality::Low,
+        "medium" => StageQuality::Medium,
+        "best" => StageQuality::Best,
+        _ => StageQuality::High,
     }
 }
 
@@ -163,6 +178,28 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for AndroidExecutor {
     }
 }
 
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn catch_recoverable_panic<F, R>(f: F) -> Result<R, Box<dyn Any + Send>>
+where
+    F: FnOnce() -> R,
+{
+    SUPPRESS_PANIC_CALLBACK.with(|flag| {
+        let previous = flag.replace(true);
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(f));
+        flag.set(previous);
+        result
+    })
+}
+
 fn create_active_player(
     app: &AndroidApp,
     window: &ndk::native_window::NativeWindow,
@@ -172,22 +209,13 @@ fn create_active_player(
     trace_output: Option<&Path>,
     render_backend: RenderBackendPreference,
     render_scale: f64,
-) -> ActivePlayer {
-    let dimensions = viewport_dimensions(app, window, render_scale);
-    let renderer = unsafe {
-        WgpuRenderBackend::for_window_unsafe(
-            wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
-                raw_window_handle: window.window_handle().unwrap().into(),
-            },
-            (dimensions.width, dimensions.height),
-            render_backend.backends(),
-            wgpu::PowerPreference::HighPerformance,
-        )
-        .unwrap()
-    };
+    stage_quality: StageQuality,
+) -> Result<ActivePlayer, String> {
+    let dimensions = viewport_dimensions_for_backend(app, window, render_backend, render_scale);
+    let renderer = create_render_backend(window, dimensions, render_backend)?;
     let movie_url = server.movie_url();
-    let movie_url_parsed = Url::parse(&movie_url).unwrap();
+    let movie_url_parsed =
+        Url::parse(&movie_url).map_err(|error| format!("Invalid movie URL: {error}"))?;
     let player_id = PlayerId::new();
 
     let future_spawner = AndroidExecutor {
@@ -214,7 +242,10 @@ fn create_active_player(
         id: player_id,
         player: PlayerBuilder::new()
             .with_renderer(renderer)
-            .with_audio(AAudioAudioBackend::new().unwrap())
+            .with_audio(
+                AAudioAudioBackend::new()
+                    .map_err(|error| format!("Failed to initialize audio: {error}"))?,
+            )
             .with_storage(Box::new(DiskStorageBackend::new(
                 android_storage_dir.to_path_buf(),
             )))
@@ -223,6 +254,7 @@ fn create_active_player(
             .with_log(FileLogBackend::new(trace_output))
             .with_video(ruffle_video_software::backend::SoftwareVideoBackend::new())
             .with_letterbox(ruffle_core::config::Letterbox::On)
+            .with_quality(stage_quality)
             .with_align(StageAlign::empty(), true)
             .with_scale_mode(StageScaleMode::ShowAll, true)
             .with_fullscreen(true)
@@ -230,15 +262,68 @@ fn create_active_player(
     };
 
     {
-        let mut player_lock = active_player.player.lock().unwrap();
+        let mut player_lock = active_player
+            .player
+            .lock()
+            .map_err(|error| format!("Failed to lock player during startup: {error}"))?;
         set_android_default_fonts(&mut player_lock);
         player_lock.fetch_root_movie(movie_url, Vec::new(), Box::new(|_| {}));
         player_lock.set_is_playing(true);
         player_lock.set_letterbox(ruffle_core::config::Letterbox::On);
+        player_lock.set_quality(stage_quality);
         player_lock.set_viewport_dimensions(dimensions);
     }
 
-    active_player
+    Ok(active_player)
+}
+
+fn create_render_backend(
+    window: &ndk::native_window::NativeWindow,
+    dimensions: ViewportDimensions,
+    render_backend: RenderBackendPreference,
+) -> Result<WgpuRenderBackend<SwapChainTarget>, String> {
+    let mut last_error = String::from("unknown error");
+
+    for attempt in 1..=5 {
+        let raw_window_handle = match window.window_handle() {
+            Ok(handle) => handle.into(),
+            Err(error) => {
+                last_error = format!("Window handle unavailable: {error:?}");
+                break;
+            }
+        };
+
+        let result = catch_recoverable_panic(|| unsafe {
+            WgpuRenderBackend::for_window_unsafe(
+                wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                    raw_window_handle,
+                },
+                (dimensions.width, dimensions.height),
+                render_backend.backends(),
+                wgpu::PowerPreference::HighPerformance,
+            )
+        });
+
+        match result {
+            Ok(Ok(renderer)) => return Ok(renderer),
+            Ok(Err(error)) => {
+                last_error = format!("{error:?}");
+                log::warn!("Render surface creation attempt {attempt} failed: {last_error}");
+            }
+            Err(payload) => {
+                last_error = format!(
+                    "panic while creating render surface: {}",
+                    panic_payload_message(payload.as_ref())
+                );
+                log::warn!("Render surface creation attempt {attempt} panicked: {last_error}");
+            }
+        }
+
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    Err(last_error)
 }
 
 fn load_replacement_root_movie<'gc>(
@@ -248,45 +333,55 @@ fn load_replacement_root_movie<'gc>(
     let player = uc.player_handle();
 
     Box::pin(async move {
-        let fetch = player
-            .lock()
-            .unwrap()
-            .fetch(Request::get(movie_url), FetchReason::LoadSwf);
+        let fetch = match player.lock() {
+            Ok(player) => player.fetch(Request::get(movie_url), FetchReason::LoadSwf),
+            Err(error) => {
+                log::warn!("Skipping Flash reload; player lock is poisoned: {error}");
+                return Ok(());
+            }
+        };
         let response = fetch.await.map_err(|error| {
-            player
-                .lock()
-                .unwrap()
-                .ui()
-                .display_root_movie_download_failed_message(false, error.error.to_string());
+            if let Ok(player) = player.lock() {
+                player
+                    .ui()
+                    .display_root_movie_download_failed_message(false, error.error.to_string());
+            }
             error.error
         })?;
         let swf_url = response.url().into_owned();
         let body = response.body().await.map_err(|error| {
-            player
-                .lock()
-                .unwrap()
-                .ui()
-                .display_root_movie_download_failed_message(true, error.to_string());
+            if let Ok(player) = player.lock() {
+                player
+                    .ui()
+                    .display_root_movie_download_failed_message(true, error.to_string());
+            }
             error
         })?;
 
-        let spoofed_or_swf_url = player
-            .lock()
-            .unwrap()
-            .spoofed_url()
-            .map(|url| url.to_string())
-            .unwrap_or(swf_url);
+        let spoofed_or_swf_url = match player.lock() {
+            Ok(player) => player
+                .spoofed_url()
+                .map(|url| url.to_string())
+                .unwrap_or(swf_url),
+            Err(error) => {
+                log::warn!("Using fetched URL during reload; player lock is poisoned: {error}");
+                swf_url
+            }
+        };
 
         let movie = SwfMovie::from_data(&body, spoofed_or_swf_url, None).map_err(|error| {
-            player
-                .lock()
-                .unwrap()
-                .ui()
-                .display_root_movie_download_failed_message(true, error.to_string());
+            if let Ok(player) = player.lock() {
+                player
+                    .ui()
+                    .display_root_movie_download_failed_message(true, error.to_string());
+            }
             ruffle_core::loader::Error::InvalidSwf(error)
         })?;
 
-        let mut player_lock = player.lock().unwrap();
+        let Ok(mut player_lock) = player.lock() else {
+            log::warn!("Skipping Flash reload apply; player lock is poisoned");
+            return Ok(());
+        };
         player_lock.set_is_playing(false);
         player_lock.mutate_with_update_context(|uc| {
             uc.replace_root_movie(movie);
@@ -300,6 +395,7 @@ fn recreate_player_surface(
     app: &AndroidApp,
     active_player: &ActivePlayer,
     window: &ndk::native_window::NativeWindow,
+    render_backend: RenderBackendPreference,
     render_scale: f64,
     resume_playback: bool,
 ) -> bool {
@@ -335,22 +431,37 @@ fn recreate_player_surface(
         return false;
     };
 
-    let result = unsafe {
+    let result = catch_recoverable_panic(|| unsafe {
         renderer.recreate_surface_unsafe(
             wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
                 raw_window_handle,
             },
-            render_surface_size(window, render_scale),
+            render_surface_size_for_backend(window, render_backend, render_scale),
         )
-    };
+    });
 
-    if let Err(error) = result {
-        log::warn!("Failed to recreate render surface: {error:?}");
-        return false;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            log::warn!("Failed to recreate render surface: {error:?}");
+            return false;
+        }
+        Err(payload) => {
+            log::warn!(
+                "Panic while recreating render surface: {}",
+                panic_payload_message(payload.as_ref())
+            );
+            return false;
+        }
     }
 
-    player_lock.set_viewport_dimensions(viewport_dimensions(app, window, render_scale));
+    player_lock.set_viewport_dimensions(viewport_dimensions_for_backend(
+        app,
+        window,
+        render_backend,
+        render_scale,
+    ));
     if resume_playback {
         player_lock.set_is_playing(true);
     }
@@ -401,6 +512,7 @@ async fn run(app: AndroidApp) {
     let android_app_data_dir;
     let render_backend;
     let render_scale;
+    let mut stage_quality;
 
     unsafe {
         let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut sys::JavaVM).expect("JVM must exist");
@@ -415,10 +527,18 @@ async fn run(app: AndroidApp) {
         ));
         render_scale =
             sanitize_render_scale(JavaInterface::get_render_scale(&mut jni_env, &activity));
+        stage_quality =
+            stage_quality_from_key(&JavaInterface::get_stage_quality(&mut jni_env, &activity));
         let _ = jni_env.set_rust_field(activity, "eventLoopHandle", sender.clone());
     }
     log::info!("Render backend preference: {}", render_backend.key());
     log::info!("Render resolution scale: {:.2}", render_scale);
+    if render_backend == RenderBackendPreference::OpenGl && render_scale < 1.0 {
+        log::warn!(
+            "OpenGL ES backend requires native Android surface size; resolution scale will be ignored"
+        );
+    }
+    log::info!("Stage quality: {stage_quality}");
 
     let load_failure_notifier: seer2::LoadFailureNotifier =
         Arc::new(|message| show_load_failure(&message));
@@ -471,8 +591,12 @@ async fn run(app: AndroidApp) {
                                         window.width(),
                                         window.height()
                                     );
-                                    let dimensions =
-                                        viewport_dimensions(&app, window, render_scale);
+                                    let dimensions = viewport_dimensions_for_backend(
+                                        &app,
+                                        window,
+                                        render_backend,
+                                        render_scale,
+                                    );
                                     player_lock.set_viewport_dimensions(dimensions);
                                     needs_redraw = true;
                                 }
@@ -491,6 +615,7 @@ async fn run(app: AndroidApp) {
                                     &app,
                                     player,
                                     window,
+                                    render_backend,
                                     render_scale,
                                     false,
                                 );
@@ -510,7 +635,12 @@ async fn run(app: AndroidApp) {
                             log::warn!("Ignoring InitWindow because native_window is unavailable");
                             return;
                         };
-                        let dimensions = viewport_dimensions(&app, window, render_scale);
+                        let dimensions = viewport_dimensions_for_backend(
+                            &app,
+                            window,
+                            render_backend,
+                            render_scale,
+                        );
                         log::info!(
                             "Init window: {} x {} -> render {} x {} (is existing: {})",
                             window.width(),
@@ -527,6 +657,7 @@ async fn run(app: AndroidApp) {
                                 &app,
                                 activeplayer,
                                 window,
+                                render_backend,
                                 render_scale,
                                 app_resumed,
                             );
@@ -534,7 +665,7 @@ async fn run(app: AndroidApp) {
                                 set_audio_output(activeplayer, true);
                             }
                         } else if let Some(seer2_server) = seer2_server.as_ref() {
-                            playerbox = Some(create_active_player(
+                            match create_active_player(
                                 &app,
                                 window,
                                 seer2_server,
@@ -543,11 +674,22 @@ async fn run(app: AndroidApp) {
                                 trace_output.as_deref(),
                                 render_backend,
                                 render_scale,
-                            ));
-                            last_frame_time = Instant::now();
-                            next_frame_time = Some(Instant::now());
+                                stage_quality,
+                            ) {
+                                Ok(active_player) => {
+                                    playerbox = Some(active_player);
+                                    last_frame_time = Instant::now();
+                                    next_frame_time = Some(Instant::now());
 
-                            log::info!("MOVIE STARTED");
+                                    log::info!("MOVIE STARTED");
+                                }
+                                Err(error) => {
+                                    log::error!("Failed to create player: {error}");
+                                    show_load_failure(&format!(
+                                        "游戏渲染初始化失败，请切换渲染器后重试。\n{error}"
+                                    ));
+                                }
+                            }
                         } else {
                             log::warn!("Seer2 local server is unavailable; player not started");
                         }
@@ -574,7 +716,11 @@ async fn run(app: AndroidApp) {
                                         return InputStatus::Unhandled;
                                     };
                                     let (render_width, render_height) =
-                                        render_surface_size(window, render_scale);
+                                        render_surface_size_for_backend(
+                                            window,
+                                            render_backend,
+                                            render_scale,
+                                        );
                                     x = x * render_width as f64 / view_size.0 as f64;
                                     y = y * render_height as f64 / view_size.1 as f64;
                                     let ruffle_event = match event.action() {
@@ -602,7 +748,9 @@ async fn run(app: AndroidApp) {
                                     };
 
                                     if let Some(player) = playerbox.as_ref() {
-                                        player.player.lock().unwrap().handle_event(ruffle_event);
+                                        if let Ok(mut player) = player.player.lock() {
+                                            player.handle_event(ruffle_event);
+                                        }
                                     }
 
                                     InputStatus::Handled
@@ -630,18 +778,21 @@ async fn run(app: AndroidApp) {
                                             }
                                             _ => return InputStatus::Unhandled,
                                         };
-                                        player.player.lock().unwrap().handle_event(ruffle_event);
+                                        if let Ok(mut player_lock) = player.player.lock() {
+                                            player_lock.handle_event(ruffle_event);
 
-                                        // TODO: Use `KeyEvent.unicode_char` when it's available:
-                                        // https://github.com/rust-mobile/android-activity/issues/183
-                                        if down {
-                                            if let LogicalKey::Character(c) =
-                                                key_descriptor.logical_key
-                                            {
-                                                let event = PlayerEvent::TextInput { codepoint: c };
-                                                player.player.lock().unwrap().handle_event(event);
+                                            // TODO: Use `KeyEvent.unicode_char` when it's available:
+                                            // https://github.com/rust-mobile/android-activity/issues/183
+                                            if down {
+                                                if let LogicalKey::Character(c) =
+                                                    key_descriptor.logical_key
+                                                {
+                                                    let event =
+                                                        PlayerEvent::TextInput { codepoint: c };
+                                                    player_lock.handle_event(event);
+                                                }
                                             }
-                                        };
+                                        }
 
                                         needs_redraw = true;
                                     }
@@ -660,89 +811,155 @@ async fn run(app: AndroidApp) {
             }
         });
 
-        match receiver.try_recv() {
-            Err(_) => {}
-            Ok(RuffleEvent::TaskPoll(task)) => {
-                // Only run the task if it matches our current player;
-                // otherwise it is stale, and should be cancelled (which
-                // happens implicitly on drop).
-                if let Some(player) = playerbox.as_ref() {
-                    if *task.0.metadata() == player.id {
-                        task.0.run();
+        for _ in 0..256 {
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+
+            match event {
+                RuffleEvent::TaskPoll(task) => {
+                    // Only run the task if it matches our current player;
+                    // otherwise it is stale, and should be cancelled (which
+                    // happens implicitly on drop).
+                    if let Some(player) = playerbox.as_ref() {
+                        if *task.0.metadata() == player.id {
+                            task.0.run();
+                        }
                     }
                 }
-            }
-            Ok(RuffleEvent::VirtualKeyEvent {
-                down,
-                key_descriptor,
-            }) => {
-                if let Some(player) = playerbox.as_ref() {
-                    let event = if down {
-                        PlayerEvent::KeyDown {
-                            key: key_descriptor,
+                RuffleEvent::VirtualKeyEvent {
+                    down,
+                    key_descriptor,
+                } => {
+                    if let Some(player) = playerbox.as_ref() {
+                        let Ok(mut player_lock) = player.player.lock() else {
+                            log::warn!("Skipping virtual key event; player lock is poisoned");
+                            continue;
+                        };
+                        let event = if down {
+                            PlayerEvent::KeyDown {
+                                key: key_descriptor,
+                            }
+                        } else {
+                            PlayerEvent::KeyUp {
+                                key: key_descriptor,
+                            }
+                        };
+                        player_lock.handle_event(event);
+
+                        if down {
+                            // TODO: Add shift/capslock and pass in uppercase characters accordingly
+                            if let LogicalKey::Character(c) = key_descriptor.logical_key {
+                                let event = PlayerEvent::TextInput { codepoint: c };
+                                player_lock.handle_event(event);
+                            }
+                        }
+                    }
+                }
+                RuffleEvent::TextInput(text) => {
+                    if let Some(player) = playerbox.as_ref() {
+                        if let Ok(mut player) = player.player.lock() {
+                            for codepoint in text.chars() {
+                                player.handle_event(PlayerEvent::TextInput { codepoint });
+                            }
+                        } else {
+                            log::warn!("Skipping text input; player lock is poisoned");
+                        }
+                    }
+                }
+                RuffleEvent::TextControl { code, repeat_count } => {
+                    if let Some(player) = playerbox.as_ref() {
+                        if let Ok(mut player) = player.player.lock() {
+                            for _ in 0..repeat_count.max(1) {
+                                if matches!(code, TextControlCode::Backspace) {
+                                    if let Some(key) = key_tag_to_key_descriptor("BACKSPACE") {
+                                        player.handle_event(PlayerEvent::KeyDown { key });
+                                        player.handle_event(PlayerEvent::KeyUp { key });
+                                    }
+                                }
+                                player.handle_event(PlayerEvent::TextControl { code });
+                            }
+                        } else {
+                            log::warn!("Skipping text control input; player lock is poisoned");
+                        }
+                    }
+                }
+                RuffleEvent::SetStageQuality(quality) => {
+                    stage_quality = quality;
+                    if let Some(player) = playerbox.as_ref() {
+                        if let Ok(mut player) = player.player.lock() {
+                            player.set_quality(quality);
+                            needs_redraw = true;
+                        } else {
+                            log::warn!("Skipping stage quality change; player lock is poisoned");
+                        }
+                    }
+                }
+                RuffleEvent::RunContextMenuCallback(index) => {
+                    if let Some(player) = playerbox.as_ref() {
+                        if let Ok(mut player) = player.player.lock() {
+                            player.run_context_menu_callback(index);
+                        } else {
+                            log::warn!("Skipping context menu callback; player lock is poisoned");
+                        }
+                    }
+                }
+                RuffleEvent::ClearContextMenu => {
+                    if let Some(player) = playerbox.as_ref() {
+                        if let Ok(mut player) = player.player.lock() {
+                            player.clear_custom_menu_items();
+                        } else {
+                            log::warn!("Skipping context menu clear; player lock is poisoned");
+                        }
+                    }
+                }
+                RuffleEvent::RequestContextMenu => {
+                    if let Some(player) = playerbox.as_ref() {
+                        log::warn!("preparing context menu!");
+                        let items = match player.player.lock() {
+                            Ok(mut player) => player.prepare_context_menu(),
+                            Err(error) => {
+                                log::warn!(
+                                    "Skipping context menu; player lock is poisoned: {error}"
+                                );
+                                continue;
+                            }
+                        };
+                        match get_jvm() {
+                            Ok((jvm, activity)) => match jvm.attach_current_thread() {
+                                Ok(mut env) => {
+                                    JavaInterface::show_context_menu(&mut env, &activity, &items)
+                                }
+                                Err(error) => {
+                                    log::warn!("Skipping context menu; JVM attach failed: {error}")
+                                }
+                            },
+                            Err(error) => {
+                                log::warn!("Skipping context menu; JVM unavailable: {error}")
+                            }
+                        }
+                    }
+                }
+                RuffleEvent::ReloadMovie => {
+                    if let (Some(player), Some(server)) =
+                        (playerbox.as_ref(), seer2_server.as_ref())
+                    {
+                        log::info!("Replacing root Flash movie");
+                        let movie_url = server.movie_url();
+                        if let Ok(mut player) = player.player.lock() {
+                            player.mutate_with_update_context(|uc| {
+                                let future = load_replacement_root_movie(uc, movie_url);
+                                uc.navigator.spawn_future(future);
+                            });
+                            needs_redraw = true;
+                        } else {
+                            log::warn!("Ignoring Flash reload request; player lock is poisoned");
                         }
                     } else {
-                        PlayerEvent::KeyUp {
-                            key: key_descriptor,
-                        }
-                    };
-                    player.player.lock().unwrap().handle_event(event);
-
-                    if down {
-                        // TODO: Add shift/capslock and pass in uppercase characters accordingly
-                        if let LogicalKey::Character(c) = key_descriptor.logical_key {
-                            let event = PlayerEvent::TextInput { codepoint: c };
-                            player.player.lock().unwrap().handle_event(event);
-                        }
+                        log::warn!("Ignoring Flash reload request before player is ready");
                     }
-                }
-            }
-            Ok(RuffleEvent::TextInput(text)) => {
-                if let Some(player) = playerbox.as_ref() {
-                    let mut player = player.player.lock().unwrap();
-                    for codepoint in text.chars() {
-                        player.handle_event(PlayerEvent::TextInput { codepoint });
-                    }
-                }
-            }
-            Ok(RuffleEvent::RunContextMenuCallback(index)) => {
-                if let Some(player) = playerbox.as_ref() {
-                    player
-                        .player
-                        .lock()
-                        .unwrap()
-                        .run_context_menu_callback(index);
-                }
-            }
-            Ok(RuffleEvent::ClearContextMenu) => {
-                if let Some(player) = playerbox.as_ref() {
-                    player.player.lock().unwrap().clear_custom_menu_items();
-                }
-            }
-            Ok(RuffleEvent::RequestContextMenu) => {
-                if let Some(player) = playerbox.as_ref() {
-                    log::warn!("preparing context menu!");
-                    let items = player.player.lock().unwrap().prepare_context_menu();
-                    let (jvm, activity) = get_jvm().unwrap();
-                    let mut env = jvm.attach_current_thread().unwrap();
-                    JavaInterface::show_context_menu(&mut env, &activity, &items);
-                }
-            }
-            Ok(RuffleEvent::ReloadMovie) => {
-                if let (Some(player), Some(server)) = (playerbox.as_ref(), seer2_server.as_ref()) {
-                    log::info!("Replacing root Flash movie");
-                    let movie_url = server.movie_url();
-                    player
-                        .player
-                        .lock()
-                        .unwrap()
-                        .mutate_with_update_context(|uc| {
-                            let future = load_replacement_root_movie(uc, movie_url);
-                            uc.navigator.spawn_future(future);
-                        });
-                    needs_redraw = true;
-                } else {
-                    log::warn!("Ignoring Flash reload request before player is ready");
                 }
             }
         }
@@ -758,9 +975,13 @@ async fn run(app: AndroidApp) {
                     player.tick(FloatDuration::from_millis(dt as f64 / 1000.0));
                     next_frame_time = Some(new_time + player.time_til_next_frame());
                     needs_redraw = player.needs_render();
-                    let audio =
-                        <dyn Any>::downcast_mut::<AAudioAudioBackend>(player.audio_mut()).unwrap();
-                    audio.recreate_stream_if_needed();
+                    if let Some(audio) =
+                        <dyn Any>::downcast_mut::<AAudioAudioBackend>(player.audio_mut())
+                    {
+                        audio.recreate_stream_if_needed();
+                    } else {
+                        log::warn!("Skipping audio stream maintenance; audio backend mismatch");
+                    }
                 }
             } else {
                 next_frame_time = None;
@@ -806,17 +1027,68 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_commitText(
     this: JObject,
     text: JString,
 ) {
-    let text: String = env
-        .get_string(&text)
-        .expect("Couldn't get java string!")
-        .into();
+    let text: String = match env.get_string(&text) {
+        Ok(text) => text.into(),
+        Err(error) => {
+            log::warn!("Ignoring IME text; failed to read Java string: {error}");
+            return;
+        }
+    };
 
     if text.is_empty() {
         return;
     }
 
-    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
-    event_loop.send(RuffleEvent::TextInput(text));
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::TextInput(text)),
+        Err(error) => log::warn!("Ignoring IME text before event loop is ready: {error:?}"),
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_deleteBackward(
+    mut env: JNIEnv,
+    this: JObject,
+    repeat_count: jint,
+) {
+    let repeat_count = repeat_count.clamp(1, 8) as u32;
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::TextControl {
+            code: TextControlCode::Backspace,
+            repeat_count,
+        }),
+        Err(error) => log::warn!("Ignoring backspace before event loop is ready: {error:?}"),
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setStageQuality(
+    mut env: JNIEnv,
+    this: JObject,
+    key: JString,
+) {
+    let key: String = match env.get_string(&key) {
+        Ok(key) => key.into(),
+        Err(error) => {
+            log::warn!("Ignoring stage quality change; failed to read Java string: {error}");
+            return;
+        }
+    };
+
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => {
+            event_loop.send(RuffleEvent::SetStageQuality(stage_quality_from_key(&key)))
+        }
+        Err(error) => log::warn!("Ignoring stage quality change before event loop: {error:?}"),
+    }
 }
 
 #[no_mangle]
@@ -826,17 +1098,26 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydown(
     this: JObject,
     key_tag: JString,
 ) {
-    let tag: String = env
-        .get_string(&key_tag)
-        .expect("Couldn't get java string!")
-        .into();
+    let tag: String = match env.get_string(&key_tag) {
+        Ok(tag) => tag.into(),
+        Err(error) => {
+            log::warn!("Ignoring keydown; failed to read Java string: {error}");
+            return;
+        }
+    };
 
-    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
-    if let Some(desc) = key_tag_to_key_descriptor(&tag) {
-        event_loop.send(RuffleEvent::VirtualKeyEvent {
-            down: true,
-            key_descriptor: desc,
-        });
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => {
+            if let Some(desc) = key_tag_to_key_descriptor(&tag) {
+                event_loop.send(RuffleEvent::VirtualKeyEvent {
+                    down: true,
+                    key_descriptor: desc,
+                });
+            }
+        }
+        Err(error) => log::warn!("Ignoring keydown before event loop is ready: {error:?}"),
     }
 }
 
@@ -847,23 +1128,38 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyup(
     this: JObject,
     key_tag: JString,
 ) {
-    let tag: String = env
-        .get_string(&key_tag)
-        .expect("Couldn't get java string!")
-        .into();
+    let tag: String = match env.get_string(&key_tag) {
+        Ok(tag) => tag.into(),
+        Err(error) => {
+            log::warn!("Ignoring keyup; failed to read Java string: {error}");
+            return;
+        }
+    };
 
-    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
-    if let Some(desc) = key_tag_to_key_descriptor(&tag) {
-        event_loop.send(RuffleEvent::VirtualKeyEvent {
-            down: false,
-            key_descriptor: desc,
-        });
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => {
+            if let Some(desc) = key_tag_to_key_descriptor(&tag) {
+                event_loop.send(RuffleEvent::VirtualKeyEvent {
+                    down: false,
+                    key_descriptor: desc,
+                });
+            }
+        }
+        Err(error) => log::warn!("Ignoring keyup before event loop is ready: {error:?}"),
     }
 }
 
 pub fn get_jvm<'a>() -> Result<(jni::JavaVM, JObject<'a>), Box<dyn std::error::Error>> {
     // Create a VM for executing Java calls
-    let context = ndk_context::android_context();
+    let context = panic::catch_unwind(ndk_context::android_context).map_err(|payload| {
+        let message = format!(
+            "android context is not initialized: {}",
+            panic_payload_message(payload.as_ref())
+        );
+        std::io::Error::new(std::io::ErrorKind::Other, message)
+    })?;
     let activity = unsafe { JObject::from_raw(context.context().cast()) };
     let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }?;
 
@@ -898,9 +1194,9 @@ fn update_server_metrics(text: &str) {
     match get_jvm() {
         Ok((jvm, activity)) => match jvm.attach_current_thread() {
             Ok(mut env) => JavaInterface::update_server_metrics(&mut env, &activity, text),
-            Err(err) => log::error!("Failed to attach JVM for server metrics: {}", err),
+            Err(err) => log::debug!("Failed to attach JVM for server metrics: {}", err),
         },
-        Err(err) => log::error!("Failed to get JVM for server metrics: {}", err),
+        Err(err) => log::debug!("Failed to get JVM for server metrics: {}", err),
     }
 }
 
@@ -908,9 +1204,9 @@ fn update_fps(text: &str) {
     match get_jvm() {
         Ok((jvm, activity)) => match jvm.attach_current_thread() {
             Ok(mut env) => JavaInterface::update_fps(&mut env, &activity, text),
-            Err(err) => log::error!("Failed to attach JVM for FPS overlay: {}", err),
+            Err(err) => log::debug!("Failed to attach JVM for FPS overlay: {}", err),
         },
-        Err(err) => log::error!("Failed to get JVM for FPS overlay: {}", err),
+        Err(err) => log::debug!("Failed to get JVM for FPS overlay: {}", err),
     }
 }
 
@@ -920,6 +1216,26 @@ fn sanitize_render_scale(scale: f32) -> f64 {
     } else {
         1.0
     }
+}
+
+fn effective_render_scale(render_backend: RenderBackendPreference, render_scale: f64) -> f64 {
+    match render_backend {
+        RenderBackendPreference::OpenGl => 1.0,
+        RenderBackendPreference::Auto | RenderBackendPreference::Vulkan => render_scale,
+    }
+}
+
+fn viewport_dimensions_for_backend(
+    app: &AndroidApp,
+    window: &ndk::native_window::NativeWindow,
+    render_backend: RenderBackendPreference,
+    render_scale: f64,
+) -> ViewportDimensions {
+    viewport_dimensions(
+        app,
+        window,
+        effective_render_scale(render_backend, render_scale),
+    )
 }
 
 fn viewport_dimensions(
@@ -939,6 +1255,14 @@ fn viewport_dimensions(
         height,
         scale_factor: scale_factor * render_scale,
     }
+}
+
+fn render_surface_size_for_backend(
+    window: &ndk::native_window::NativeWindow,
+    render_backend: RenderBackendPreference,
+    render_scale: f64,
+) -> (u32, u32) {
+    render_surface_size(window, effective_render_scale(render_backend, render_scale))
 }
 
 fn render_surface_size(window: &ndk::native_window::NativeWindow, render_scale: f64) -> (u32, u32) {
@@ -973,8 +1297,12 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_requestContextMenu(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
-    event_loop.send(RuffleEvent::RequestContextMenu);
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::RequestContextMenu),
+        Err(error) => log::warn!("Ignoring context menu request before event loop: {error:?}"),
+    }
 }
 
 #[no_mangle]
@@ -984,8 +1312,12 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_runContextMenuCallback(
     this: JObject,
     index: jint,
 ) {
-    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
-    event_loop.send(RuffleEvent::RunContextMenuCallback(index as usize));
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::RunContextMenuCallback(index as usize)),
+        Err(error) => log::warn!("Ignoring context menu callback before event loop: {error:?}"),
+    }
 }
 
 #[no_mangle]
@@ -994,8 +1326,12 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_clearContextMenu(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
-    event_loop.send(RuffleEvent::ClearContextMenu);
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::ClearContextMenu),
+        Err(error) => log::warn!("Ignoring context menu clear before event loop: {error:?}"),
+    }
 }
 
 #[no_mangle]
@@ -1016,9 +1352,6 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
     class: JClass,
     crash_callback: JObject,
 ) {
-    let crash_callback = env.new_global_ref(crash_callback).unwrap();
-    let jvm = env.get_java_vm().unwrap();
-
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
@@ -1029,6 +1362,23 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
                     .build(),
             ),
     );
+
+    let crash_callback = match env.new_global_ref(crash_callback) {
+        Ok(callback) => callback,
+        Err(error) => {
+            log::error!("Failed to create crash callback global ref: {error}");
+            JavaInterface::init(&mut env, &class);
+            return;
+        }
+    };
+    let jvm = match env.get_java_vm() {
+        Ok(jvm) => jvm,
+        Err(error) => {
+            log::error!("Failed to get JavaVM for crash hook: {error}");
+            JavaInterface::init(&mut env, &class);
+            return;
+        }
+    };
 
     panic::set_hook(Box::new(move |info| {
         let backtrace = Backtrace::new();
@@ -1058,19 +1408,34 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
         };
         log::error!(target: "panic","{}", full);
 
-        let mut env = jvm.attach_current_thread().unwrap();
-        if env.exception_check().unwrap() {
-            // There's a pending exception, java will discover this on their own
-        } else {
-            let java_message = env.new_string(full).unwrap();
-            let crash_callback = env.new_global_ref(&crash_callback).unwrap();
-            env.call_method(
-                crash_callback,
-                "onCrash",
-                "(Ljava/lang/String;)V",
-                &[(&java_message).into()],
-            )
-            .unwrap();
+        if SUPPRESS_PANIC_CALLBACK.with(Cell::get) {
+            log::warn!("Suppressing crash callback for recoverable native panic");
+            return;
+        }
+
+        let Ok(mut env) = jvm.attach_current_thread() else {
+            log::error!("Failed to attach JVM while reporting native panic");
+            return;
+        };
+        match env.exception_check() {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                log::error!("Failed to check pending Java exception: {error}");
+                return;
+            }
+        }
+        let Ok(java_message) = env.new_string(full) else {
+            log::error!("Failed to allocate native panic message string");
+            return;
+        };
+        if let Err(error) = env.call_method(
+            crash_callback.as_obj(),
+            "onCrash",
+            "(Ljava/lang/String;)V",
+            &[(&java_message).into()],
+        ) {
+            log::error!("Failed to call native panic callback: {error}");
         }
     }));
 
@@ -1078,13 +1443,19 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
 }
 
 fn get_loc_in_window() -> (i32, i32) {
-    let (jvm, activity) = get_jvm().unwrap();
-    let mut env = jvm.attach_current_thread().unwrap();
-
-    // no worky :(
-    //ndk_glue::native_activity().show_soft_input(true);
-
-    JavaInterface::get_loc_in_window(&mut env, &activity)
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => JavaInterface::get_loc_in_window(&mut env, &activity),
+            Err(error) => {
+                log::warn!("Failed to attach JVM for input coordinates: {error}");
+                (0, 0)
+            }
+        },
+        Err(error) => {
+            log::warn!("Failed to get JVM for input coordinates: {error}");
+            (0, 0)
+        }
+    }
 }
 
 fn get_view_size() -> Result<(i32, i32), Box<dyn std::error::Error>> {

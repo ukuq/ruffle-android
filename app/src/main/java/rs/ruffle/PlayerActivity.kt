@@ -15,9 +15,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
-import android.view.KeyEvent
 import android.util.Log
 import android.util.TypedValue
+import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
@@ -27,6 +27,8 @@ import android.view.Window
 import android.view.WindowManager
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedText
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
@@ -51,13 +53,20 @@ class PlayerActivity : GameActivity() {
     private enum class RenderBackend(val key: String, val label: String) {
         AUTO("auto", "自动"),
         VULKAN("vulkan", "Vulkan"),
-        OPENGL("opengl", "OpenGL ES"),
+        OPENGL("opengl", "OpenGL ES")
     }
 
     private enum class RenderScale(val key: String, val label: String, val value: Float) {
         NATIVE("1.0", "100%", 1.0f),
         BALANCED("0.75", "75%", 0.75f),
-        PERFORMANCE("0.5", "50%", 0.5f),
+        PERFORMANCE("0.5", "50%", 0.5f)
+    }
+
+    private enum class StageQuality(val key: String, val label: String) {
+        BEST("best", "\u6700\u9ad8"),
+        HIGH("high", "\u9ad8"),
+        MEDIUM("medium", "\u4e2d"),
+        LOW("low", "\u4f4e")
     }
 
     @Suppress("unused")
@@ -94,6 +103,8 @@ class PlayerActivity : GameActivity() {
     private external fun keydown(keyTag: String)
     private external fun keyup(keyTag: String)
     private external fun commitText(text: String)
+    private external fun deleteBackward(repeatCount: Int)
+    private external fun setStageQuality(key: String)
     private external fun requestContextMenu()
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
@@ -106,16 +117,16 @@ class PlayerActivity : GameActivity() {
     private lateinit var versionView: TextView
     private lateinit var renderBackendButton: TextView
     private lateinit var renderScaleButton: TextView
+    private lateinit var stageQualityButton: TextView
     private val audioManager: AudioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
 
-    private fun dp(value: Int): Int =
-        TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP,
-            value.toFloat(),
-            resources.displayMetrics
-        ).toInt()
+    private fun dp(value: Int): Int = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP,
+        value.toFloat(),
+        resources.displayMetrics
+    ).toInt()
 
     private fun currentRenderBackend(): RenderBackend {
         val key = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -124,22 +135,38 @@ class PlayerActivity : GameActivity() {
     }
 
     private fun currentRenderScale(): RenderScale {
+        if (currentRenderBackend() == RenderBackend.OPENGL) {
+            return RenderScale.NATIVE
+        }
         val key = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(KEY_RENDER_SCALE, RenderScale.NATIVE.key)
         return RenderScale.values().firstOrNull { it.key == key } ?: RenderScale.NATIVE
     }
 
-    @Suppress("unused")
-    // Used by Rust
-    private fun getRenderBackend(): String {
-        return currentRenderBackend().key
+    private fun availableRenderScales(): List<RenderScale> =
+        if (currentRenderBackend() == RenderBackend.OPENGL) {
+            listOf(RenderScale.NATIVE)
+        } else {
+            RenderScale.values().toList()
+        }
+
+    private fun currentStageQuality(): StageQuality {
+        val key = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_STAGE_QUALITY, StageQuality.HIGH.key)
+        return StageQuality.values().firstOrNull { it.key == key } ?: StageQuality.HIGH
     }
 
     @Suppress("unused")
     // Used by Rust
-    private fun getRenderScale(): Float {
-        return currentRenderScale().value
-    }
+    private fun getRenderBackend(): String = currentRenderBackend().key
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun getRenderScale(): Float = currentRenderScale().value
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun getStageQuality(): String = currentStageQuality().key
 
     @Suppress("unused")
     // Used by Rust
@@ -269,7 +296,7 @@ class PlayerActivity : GameActivity() {
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        versionView = overlayTextView("版本:${appVersionName()}")
+        versionView = overlayTextView("v${appVersionName()}")
         diagnosticOverlay.addView(fpsView)
         diagnosticOverlay.addView(serverMetricsView)
         diagnosticOverlay.addView(versionView)
@@ -312,6 +339,7 @@ class PlayerActivity : GameActivity() {
             }
         )
         renderScaleButton = TextView(this).apply {
+            id = View.generateViewId()
             text = renderScaleButtonText(currentRenderScale())
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.TRANSPARENT)
@@ -332,6 +360,31 @@ class PlayerActivity : GameActivity() {
             ).apply {
                 startToStart = ConstraintLayout.LayoutParams.PARENT_ID
                 topToBottom = renderBackendButton.id
+                marginStart = dp(8)
+                topMargin = dp(6)
+            }
+        )
+        stageQualityButton = TextView(this).apply {
+            text = stageQualityButtonText(currentStageQuality())
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            typeface = Typeface.DEFAULT_BOLD
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            includeFontPadding = false
+            setPadding(dp(8), dp(5), dp(8), dp(5))
+            isClickable = true
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setOnClickListener { showStageQualityMenu() }
+        }
+        layout.addView(
+            stageQualityButton,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.WRAP_CONTENT,
+                ConstraintLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+                topToBottom = renderScaleButton.id
                 marginStart = dp(8)
                 topMargin = dp(6)
             }
@@ -387,13 +440,12 @@ class PlayerActivity : GameActivity() {
         toolbar.visibility = visibility
     }
 
-    private fun renderBackendButtonText(backend: RenderBackend): String {
-        return "GPU:${backend.label}"
-    }
+    private fun renderBackendButtonText(backend: RenderBackend): String = "GPU:${backend.label}"
 
-    private fun renderScaleButtonText(scale: RenderScale): String {
-        return "分辨率:${scale.label}"
-    }
+    private fun renderScaleButtonText(scale: RenderScale): String = "分辨率:${scale.label}"
+
+    private fun stageQualityButtonText(quality: StageQuality): String =
+        "\u753b\u8d28:${quality.label}"
 
     private fun showRenderBackendMenu() {
         val current = currentRenderBackend()
@@ -435,14 +487,15 @@ class PlayerActivity : GameActivity() {
 
     private fun showRenderScaleMenu() {
         val current = currentRenderScale()
+        val scales = availableRenderScales()
         val popup = PopupMenu(this, renderScaleButton)
-        RenderScale.values().forEachIndexed { index, scale ->
+        scales.forEachIndexed { index, scale ->
             val item = popup.menu.add(Menu.NONE, index, index, scale.label)
             item.isCheckable = true
             item.isChecked = scale == current
         }
         popup.setOnMenuItemClickListener { item ->
-            val selected = RenderScale.values().getOrNull(item.itemId)
+            val selected = scales.getOrNull(item.itemId)
                 ?: return@setOnMenuItemClickListener true
             if (selected != currentRenderScale()) {
                 confirmRenderScaleSwitch(selected)
@@ -466,6 +519,34 @@ class PlayerActivity : GameActivity() {
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    private fun showStageQualityMenu() {
+        val current = currentStageQuality()
+        val popup = PopupMenu(this, stageQualityButton)
+        StageQuality.values().forEachIndexed { index, quality ->
+            val item = popup.menu.add(Menu.NONE, index, index, quality.label)
+            item.isCheckable = true
+            item.isChecked = quality == current
+        }
+        popup.setOnMenuItemClickListener { item ->
+            val selected = StageQuality.values().getOrNull(item.itemId)
+                ?: return@setOnMenuItemClickListener true
+            if (selected != currentStageQuality()) {
+                applyStageQuality(selected)
+            }
+            true
+        }
+        popup.show()
+    }
+
+    private fun applyStageQuality(quality: StageQuality) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_STAGE_QUALITY, quality.key)
+            .apply()
+        stageQualityButton.text = stageQualityButtonText(quality)
+        setStageQuality(quality.key)
     }
 
     private fun confirmExit() {
@@ -544,6 +625,7 @@ class PlayerActivity : GameActivity() {
             WindowInsetsControllerCompat(window, ruffleInputView)
                 .show(WindowInsetsCompat.Type.ime())
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.restartInput(ruffleInputView)
             imm.showSoftInput(ruffleInputView, InputMethodManager.SHOW_IMPLICIT)
         }
     }
@@ -590,19 +672,17 @@ class PlayerActivity : GameActivity() {
         }
     }
 
-    private fun overlayTextView(initialText: String): TextView {
-        return TextView(this).apply {
-            text = initialText
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0x66000000)
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            includeFontPadding = false
-            setPadding(dp(6), dp(3), dp(6), dp(3))
-            isClickable = false
-            isFocusable = false
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
+    private fun overlayTextView(initialText: String): TextView = TextView(this).apply {
+        text = initialText
+        setTextColor(Color.WHITE)
+        setBackgroundColor(0x66000000)
+        typeface = Typeface.MONOSPACE
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        includeFontPadding = false
+        setPadding(dp(6), dp(3), dp(6), dp(3))
+        isClickable = false
+        isFocusable = false
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 
     @Suppress("DEPRECATION")
@@ -615,19 +695,17 @@ class PlayerActivity : GameActivity() {
         return packageInfo.versionName ?: "unknown"
     }
 
-    private fun actionButton(label: String, onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = label
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.TRANSPARENT)
-            typeface = Typeface.DEFAULT_BOLD
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            includeFontPadding = false
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            isClickable = true
-            isFocusable = false
-            setOnClickListener { onClick() }
-        }
+    private fun actionButton(label: String, onClick: () -> Unit): TextView = TextView(this).apply {
+        text = label
+        setTextColor(Color.WHITE)
+        setBackgroundColor(Color.TRANSPARENT)
+        typeface = Typeface.DEFAULT_BOLD
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        includeFontPadding = false
+        setPadding(dp(10), dp(6), dp(10), dp(6))
+        isClickable = true
+        isFocusable = false
+        setOnClickListener { onClick() }
     }
 
     private fun addTopActionButtons(layout: ConstraintLayout) {
@@ -709,6 +787,18 @@ class PlayerActivity : GameActivity() {
         keyup(tag)
     }
 
+    private fun sendBackspace(repeatCount: Int) {
+        val safeRepeatCount = when {
+            repeatCount <= 0 -> 1
+            repeatCount <= MAX_IME_DELETE_REPEAT -> repeatCount
+            else -> {
+                Log.w("ruffle", "Ignoring oversized IME delete request: $repeatCount")
+                1
+            }
+        }
+        deleteBackward(safeRepeatCount)
+    }
+
     private fun commitImeText(text: CharSequence?) {
         val value = text?.toString() ?: return
         if (value.isEmpty()) {
@@ -717,8 +807,15 @@ class PlayerActivity : GameActivity() {
 
         val typed = value.filter { it != '\n' && it != '\r' }
         if (typed.isNotEmpty()) {
-            Log.i("ruffle", "Committing IME text: ${typed.length} chars")
             commitText(typed)
+        }
+    }
+
+    private fun hideVirtualKeyboardDeferred() {
+        Handler(Looper.getMainLooper()).post {
+            if (!isFinishing && !isDestroyed) {
+                hideVirtualKeyboard()
+            }
         }
     }
 
@@ -733,58 +830,130 @@ class PlayerActivity : GameActivity() {
 
         override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
             outAttrs.inputType =
-                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             outAttrs.imeOptions =
                 EditorInfo.IME_ACTION_DONE or
-                    EditorInfo.IME_FLAG_NO_EXTRACT_UI or
-                    EditorInfo.IME_FLAG_NO_FULLSCREEN
+                EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                EditorInfo.IME_FLAG_NO_FULLSCREEN
 
-            return object : BaseInputConnection(this, true) {
-                override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                    val handled = super.commitText(text, newCursorPosition)
-                    commitImeText(text)
-                    editable?.clear()
-                    return handled
+            return object : BaseInputConnection(this, false) {
+                private val shadowText = StringBuilder()
+
+                private fun appendShadow(text: CharSequence?) {
+                    val value = text?.toString() ?: return
+                    val typed = value.filter { it != '\n' && it != '\r' }
+                    if (typed.isEmpty()) {
+                        return
+                    }
+                    shadowText.append(typed)
+                    if (shadowText.length > MAX_IME_SHADOW_CHARS) {
+                        shadowText.delete(0, shadowText.length - MAX_IME_SHADOW_CHARS)
+                    }
                 }
 
-                override fun deleteSurroundingText(
-                    beforeLength: Int,
-                    afterLength: Int
-                ): Boolean {
-                    sendVirtualKey("BACKSPACE")
-                    editable?.clear()
+                private fun deleteShadow(beforeLength: Int) {
+                    if (shadowText.isEmpty()) {
+                        return
+                    }
+                    val count = beforeLength
+                        .coerceAtLeast(1)
+                        .coerceAtMost(shadowText.length)
+                    shadowText.delete(shadowText.length - count, shadowText.length)
+                }
+
+                override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                    commitImeText(text)
+                    appendShadow(text)
+                    return true
+                }
+
+                override fun setComposingText(
+                    text: CharSequence?,
+                    newCursorPosition: Int
+                ): Boolean = true
+
+                override fun finishComposingText(): Boolean = true
+
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    sendBackspace(beforeLength)
+                    deleteShadow(beforeLength)
                     return true
                 }
 
                 override fun deleteSurroundingTextInCodePoints(
                     beforeLength: Int,
                     afterLength: Int
-                ): Boolean {
-                    return deleteSurroundingText(beforeLength, afterLength)
-                }
+                ): Boolean = deleteSurroundingText(beforeLength, afterLength)
 
                 override fun sendKeyEvent(event: KeyEvent): Boolean {
-                    if (event.action == KeyEvent.ACTION_DOWN) {
-                        when (event.keyCode) {
-                            KeyEvent.KEYCODE_DEL -> {
-                                sendVirtualKey("BACKSPACE")
-                                editable?.clear()
-                                return true
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_DEL -> {
+                            if (event.action == KeyEvent.ACTION_DOWN) {
+                                sendBackspace(1)
+                                deleteShadow(1)
                             }
-                            KeyEvent.KEYCODE_ENTER -> {
-                                hideVirtualKeyboard()
-                                editable?.clear()
-                                return true
+                            return true
+                        }
+                        KeyEvent.KEYCODE_ENTER -> {
+                            if (event.action == KeyEvent.ACTION_DOWN) {
+                                hideVirtualKeyboardDeferred()
                             }
+                            return true
                         }
                     }
-                    return super.sendKeyEvent(event)
+                    if (event.action == KeyEvent.ACTION_DOWN) {
+                        val unicodeChar = event.unicodeChar
+                        if (unicodeChar > 0) {
+                            val text = unicodeChar.toChar().toString()
+                            commitImeText(text)
+                            appendShadow(text)
+                            return true
+                        }
+                    }
+                    return true
                 }
 
                 override fun performEditorAction(actionCode: Int): Boolean {
-                    hideVirtualKeyboard()
-                    editable?.clear()
+                    hideVirtualKeyboardDeferred()
                     return true
+                }
+
+                override fun getTextBeforeCursor(length: Int, flags: Int): CharSequence {
+                    if (length <= 0) {
+                        return ""
+                    }
+                    if (shadowText.isEmpty()) {
+                        return IME_DELETE_SENTINEL
+                    }
+                    val start = (shadowText.length - length.coerceAtLeast(0)).coerceAtLeast(0)
+                    return shadowText.substring(start, shadowText.length)
+                }
+
+                override fun getTextAfterCursor(length: Int, flags: Int): CharSequence = ""
+
+                override fun getSelectedText(flags: Int): CharSequence? = null
+
+                override fun setSelection(start: Int, end: Int): Boolean = true
+
+                override fun getExtractedText(
+                    request: ExtractedTextRequest?,
+                    flags: Int
+                ): ExtractedText {
+                    val text = if (shadowText.isEmpty()) {
+                        IME_DELETE_SENTINEL
+                    } else {
+                        shadowText.toString()
+                    }
+                    return ExtractedText().apply {
+                        this.text = text
+                        startOffset = 0
+                        partialStartOffset = -1
+                        partialEndOffset = -1
+                        selectionStart = text.length
+                        selectionEnd = text.length
+                    }
                 }
             }
         }
@@ -837,6 +1006,16 @@ class PlayerActivity : GameActivity() {
         supportActionBar?.hide()
         super.onCreate(savedInstanceState)
         KeepAliveService.start(this)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    override fun onPause() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -925,9 +1104,13 @@ class PlayerActivity : GameActivity() {
         private const val PREFS_NAME = "ruffle_settings"
         private const val KEY_RENDER_BACKEND = "render_backend"
         private const val KEY_RENDER_SCALE = "render_scale"
+        private const val KEY_STAGE_QUALITY = "stage_quality"
         private const val CRASH_PREFS_NAME = "crash_logs"
         private const val KEY_PENDING_CRASH = "pending_native_panic"
         private const val HEALTH_NOTICE_MS = 1000L
+        private const val IME_DELETE_SENTINEL = "\u200b"
+        private const val MAX_IME_DELETE_REPEAT = 8
+        private const val MAX_IME_SHADOW_CHARS = 64
         private var crashLoggerInstalled = false
 
         init {

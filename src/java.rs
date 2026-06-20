@@ -169,6 +169,18 @@ impl JavaInterface {
             .unwrap_or(1.0)
     }
 
+    pub fn get_stage_quality(env: &mut JNIEnv, this: &JObject) -> String {
+        let result = env.call_method(this, "getStageQuality", "()Ljava/lang/String;", &[]);
+        let object = result
+            .expect("getStageQuality() must never throw")
+            .l()
+            .unwrap();
+        let string_object = JString::from(object);
+        let java_string = unsafe { env.get_string_unchecked(&string_object) };
+        let quality = java_string.unwrap().to_string_lossy().to_string();
+        quality
+    }
+
     pub fn show_load_failure(env: &mut JNIEnv, this: &JObject, message: &str) {
         let java_message = env.new_string(message).unwrap();
         let result = env.call_method(
