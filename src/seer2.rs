@@ -170,10 +170,15 @@ fn create_state(
         return Err("current client version has been disabled".into());
     }
 
+    let cache_dir = app_data_dir.join("gamecache");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|err| format!("cache dir init failed: {}: {err}", cache_dir.display()))?;
+    log::info!("Seer2 cache directory: {}", cache_dir.display());
+
     Ok(ServerState {
         root_url,
         bloom,
-        cache_dir: app_data_dir.join("Game Cache V2 Tauri"),
+        cache_dir,
         file_locks: Mutex::new(HashSet::new()),
         metrics: Arc::new(CacheMetrics::default()),
         load_failure_notifier,
@@ -255,6 +260,7 @@ impl Bloom {
 }
 
 fn handle_connection(state: Arc<ServerState>, mut stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
@@ -422,6 +428,7 @@ fn http_get_once(
         .next()
         .ok_or("HTTP host did not resolve")?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 

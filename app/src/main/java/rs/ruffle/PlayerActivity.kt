@@ -1,18 +1,19 @@
 package rs.ruffle
 
 import android.annotation.SuppressLint
-import android.app.AlarmManager
 import android.app.AlertDialog
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
-import android.net.Uri
+import android.media.AudioManager
 import android.os.Build
 import android.os.Build.VERSION_CODES
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.KeyEvent
 import android.util.Log
@@ -29,6 +30,7 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.constraintlayout.widget.ConstraintLayout
@@ -37,9 +39,12 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.google.androidgamesdk.GameActivity
-import java.io.DataInputStream
 import java.io.File
-import java.io.IOException
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.system.exitProcess
 
 class PlayerActivity : GameActivity() {
@@ -49,34 +54,11 @@ class PlayerActivity : GameActivity() {
         OPENGL("opengl", "OpenGL ES"),
     }
 
-    @Suppress("unused")
-    // Used by Rust
-    private val swfBytes: ByteArray?
-        get() {
-            val uri = intent.data
-            if (uri?.scheme == "content") {
-                try {
-                    contentResolver.openInputStream(uri).use { inputStream ->
-                        if (inputStream == null) {
-                            return null
-                        }
-                        val bytes = ByteArray(inputStream.available())
-                        val dataInputStream = DataInputStream(inputStream)
-                        dataInputStream.readFully(bytes)
-                        return bytes
-                    }
-                } catch (ignored: IOException) {
-                }
-            }
-            return null
-        }
-
-    @Suppress("unused")
-    // Used by Rust
-    private val swfUri: String?
-        get() {
-            return intent.dataString
-        }
+    private enum class RenderScale(val key: String, val label: String, val value: Float) {
+        NATIVE("1.0", "100%", 1.0f),
+        BALANCED("0.75", "75%", 0.75f),
+        PERFORMANCE("0.5", "50%", 0.5f),
+    }
 
     @Suppress("unused")
     // Used by Rust
@@ -84,12 +66,6 @@ class PlayerActivity : GameActivity() {
         get() {
             return intent.getStringExtra("traceOutput")
         }
-
-    @Suppress("unused")
-    // Used by Rust
-    private fun navigateToUrl(url: String?) {
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-    }
 
     private var loc = IntArray(2)
 
@@ -121,10 +97,18 @@ class PlayerActivity : GameActivity() {
     private external fun requestContextMenu()
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
+    private external fun reloadGame()
 
     private lateinit var ruffleInputView: RuffleInputView
+    private lateinit var diagnosticOverlay: LinearLayout
+    private lateinit var fpsView: TextView
     private lateinit var serverMetricsView: TextView
+    private lateinit var versionView: TextView
     private lateinit var renderBackendButton: TextView
+    private lateinit var renderScaleButton: TextView
+    private val audioManager: AudioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
 
     private fun dp(value: Int): Int =
         TypedValue.applyDimension(
@@ -139,10 +123,22 @@ class PlayerActivity : GameActivity() {
         return RenderBackend.values().firstOrNull { it.key == key } ?: RenderBackend.VULKAN
     }
 
+    private fun currentRenderScale(): RenderScale {
+        val key = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_RENDER_SCALE, RenderScale.NATIVE.key)
+        return RenderScale.values().firstOrNull { it.key == key } ?: RenderScale.NATIVE
+    }
+
     @Suppress("unused")
     // Used by Rust
     private fun getRenderBackend(): String {
         return currentRenderBackend().key
+    }
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun getRenderScale(): Float {
+        return currentRenderScale().value
     }
 
     @Suppress("unused")
@@ -173,7 +169,7 @@ class PlayerActivity : GameActivity() {
             menu.add(group, exitItemId, Menu.NONE, "Exit")
             popup.setOnMenuItemClickListener { item: MenuItem ->
                 if (item.itemId == exitItemId) {
-                    finish()
+                    confirmExit()
                 } else {
                     runContextMenuCallback(item.itemId)
                 }
@@ -187,7 +183,6 @@ class PlayerActivity : GameActivity() {
     @Suppress("unused")
     // Used by Rust
     private fun getAndroidDataStorageDir(): String {
-        // TODO It can also be placed in an external storage path in the future to share archived content
         val storageDirPath = "${filesDir.absolutePath}/ruffle/shared_objects"
         val storageDir = File(storageDirPath)
         if (!storageDir.exists()) {
@@ -199,7 +194,11 @@ class PlayerActivity : GameActivity() {
     @Suppress("unused")
     // Used by Rust
     private fun getAndroidAppDataDir(): String {
-        return filesDir.absolutePath
+        val appDataRoot = getExternalFilesDir(null)?.parentFile ?: filesDir
+        if (!appDataRoot.exists()) {
+            appDataRoot.mkdirs()
+        }
+        return appDataRoot.absolutePath
     }
 
     private var loadFailureShown = false
@@ -215,8 +214,8 @@ class PlayerActivity : GameActivity() {
             AlertDialog.Builder(this)
                 .setTitle("\u6e38\u620f\u52a0\u8f7d\u5931\u8d25")
                 .setMessage(message)
-                .setPositiveButton("\u9000\u51fa") { _, _ -> finish() }
-                .setOnCancelListener { finish() }
+                .setPositiveButton("\u9000\u51fa") { _, _ -> exitApplication() }
+                .setOnCancelListener { exitApplication() }
                 .show()
         }
     }
@@ -251,6 +250,13 @@ class PlayerActivity : GameActivity() {
                 bottomToBottom = ConstraintLayout.LayoutParams.PARENT_ID
             }
         )
+        diagnosticOverlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        fpsView = overlayTextView("FPS:0")
         serverMetricsView = TextView(this).apply {
             text = "hit:0\nexpired:0\nfetch:0\ncached:0\nchecked:0"
             setTextColor(Color.WHITE)
@@ -263,8 +269,12 @@ class PlayerActivity : GameActivity() {
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
+        versionView = overlayTextView("版本:${appVersionName()}")
+        diagnosticOverlay.addView(fpsView)
+        diagnosticOverlay.addView(serverMetricsView)
+        diagnosticOverlay.addView(versionView)
         layout.addView(
-            serverMetricsView,
+            diagnosticOverlay,
             ConstraintLayout.LayoutParams(
                 ConstraintLayout.LayoutParams.WRAP_CONTENT,
                 ConstraintLayout.LayoutParams.WRAP_CONTENT
@@ -276,9 +286,10 @@ class PlayerActivity : GameActivity() {
             }
         )
         renderBackendButton = TextView(this).apply {
+            id = View.generateViewId()
             text = renderBackendButtonText(currentRenderBackend())
             setTextColor(Color.WHITE)
-            setBackgroundColor(0x99000000.toInt())
+            setBackgroundColor(Color.TRANSPARENT)
             typeface = Typeface.DEFAULT_BOLD
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             includeFontPadding = false
@@ -300,6 +311,33 @@ class PlayerActivity : GameActivity() {
                 topMargin = dp(8)
             }
         )
+        renderScaleButton = TextView(this).apply {
+            text = renderScaleButtonText(currentRenderScale())
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            typeface = Typeface.DEFAULT_BOLD
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            includeFontPadding = false
+            setPadding(dp(8), dp(5), dp(8), dp(5))
+            isClickable = true
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setOnClickListener { showRenderScaleMenu() }
+        }
+        layout.addView(
+            renderScaleButton,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.WRAP_CONTENT,
+                ConstraintLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+                topToBottom = renderBackendButton.id
+                marginStart = dp(8)
+                topMargin = dp(6)
+            }
+        )
+        addTopActionButtons(layout)
+        addHealthNotice(layout)
         val keys = gatherAllDescendantsOfType<Button>(
             layout.getViewById(R.id.keyboard),
             Button::class.java
@@ -353,6 +391,10 @@ class PlayerActivity : GameActivity() {
         return "GPU:${backend.label}"
     }
 
+    private fun renderScaleButtonText(scale: RenderScale): String {
+        return "分辨率:${scale.label}"
+    }
+
     private fun showRenderBackendMenu() {
         val current = currentRenderBackend()
         val popup = PopupMenu(this, renderBackendButton)
@@ -391,22 +433,78 @@ class PlayerActivity : GameActivity() {
             .show()
     }
 
-    private fun restartApplication() {
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-            ?: Intent(this, MainActivity::class.java)
-        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        val flags = PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            RESTART_REQUEST_CODE,
-            launchIntent,
-            flags
-        )
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.set(AlarmManager.RTC, System.currentTimeMillis() + 300L, pendingIntent)
+    private fun showRenderScaleMenu() {
+        val current = currentRenderScale()
+        val popup = PopupMenu(this, renderScaleButton)
+        RenderScale.values().forEachIndexed { index, scale ->
+            val item = popup.menu.add(Menu.NONE, index, index, scale.label)
+            item.isCheckable = true
+            item.isChecked = scale == current
+        }
+        popup.setOnMenuItemClickListener { item ->
+            val selected = RenderScale.values().getOrNull(item.itemId)
+                ?: return@setOnMenuItemClickListener true
+            if (selected != currentRenderScale()) {
+                confirmRenderScaleSwitch(selected)
+            }
+            true
+        }
+        popup.show()
+    }
+
+    private fun confirmRenderScaleSwitch(scale: RenderScale) {
+        AlertDialog.Builder(this)
+            .setTitle("切换分辨率")
+            .setMessage("将切换到 ${scale.label} 并重启游戏。当前游戏画面会重新加载。")
+            .setPositiveButton("切换并重启") { _, _ ->
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_RENDER_SCALE, scale.key)
+                    .commit()
+                renderScaleButton.text = renderScaleButtonText(scale)
+                restartApplication()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmExit() {
+        AlertDialog.Builder(this)
+            .setTitle("退出游戏")
+            .setMessage("确定要退出当前游戏吗？")
+            .setPositiveButton("退出") { _, _ -> exitApplication() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmRefresh() {
+        AlertDialog.Builder(this)
+            .setTitle("刷新游戏")
+            .setMessage("确定要重新加载当前 Flash 吗？")
+            .setPositiveButton("刷新") { _, _ -> reloadGame() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun exitApplication() {
+        KeepAliveService.stop(this)
         finishAndRemoveTask()
         android.os.Process.killProcess(android.os.Process.myPid())
         exitProcess(0)
+    }
+
+    private fun restartApplication() {
+        KeepAliveService.stop(this)
+        startActivity(
+            Intent(this, RestartActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        )
+        finishAndRemoveTask()
+        Handler(Looper.getMainLooper()).postDelayed({
+            android.os.Process.killProcess(android.os.Process.myPid())
+            exitProcess(0)
+        }, 120L)
     }
 
     @Suppress("unused")
@@ -417,6 +515,17 @@ class PlayerActivity : GameActivity() {
                 return@runOnUiThread
             }
             serverMetricsView.text = text
+        }
+    }
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun updateFps(text: String) {
+        runOnUiThread {
+            if (!::fpsView.isInitialized) {
+                return@runOnUiThread
+            }
+            fpsView.text = text
         }
     }
 
@@ -470,15 +579,129 @@ class PlayerActivity : GameActivity() {
     }
 
     private fun updateServerMetricsBottomMargin(bottomInset: Int) {
-        if (!::serverMetricsView.isInitialized) {
+        if (!::diagnosticOverlay.isInitialized) {
             return
         }
-        val params = serverMetricsView.layoutParams as? ConstraintLayout.LayoutParams ?: return
+        val params = diagnosticOverlay.layoutParams as? ConstraintLayout.LayoutParams ?: return
         val bottomMargin = dp(8) + bottomInset
         if (params.bottomMargin != bottomMargin) {
             params.bottomMargin = bottomMargin
-            serverMetricsView.layoutParams = params
+            diagnosticOverlay.layoutParams = params
         }
+    }
+
+    private fun overlayTextView(initialText: String): TextView {
+        return TextView(this).apply {
+            text = initialText
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0x66000000)
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            includeFontPadding = false
+            setPadding(dp(6), dp(3), dp(6), dp(3))
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun appVersionName(): String {
+        val packageInfo = if (Build.VERSION.SDK_INT >= VERSION_CODES.TIRAMISU) {
+            packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            packageManager.getPackageInfo(packageName, 0)
+        }
+        return packageInfo.versionName ?: "unknown"
+    }
+
+    private fun actionButton(label: String, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            typeface = Typeface.DEFAULT_BOLD
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            includeFontPadding = false
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            isClickable = true
+            isFocusable = false
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun addTopActionButtons(layout: ConstraintLayout) {
+        val container = LinearLayout(this).apply {
+            id = View.generateViewId()
+            orientation = LinearLayout.VERTICAL
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        container.addView(actionButton("刷新") { confirmRefresh() })
+        container.addView(
+            actionButton("退出") { confirmExit() },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8)
+            }
+        )
+        layout.addView(
+            container,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.WRAP_CONTENT,
+                ConstraintLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                endToEnd = ConstraintLayout.LayoutParams.PARENT_ID
+                topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+                marginEnd = dp(8)
+                topMargin = dp(8)
+            }
+        )
+    }
+
+    private fun addHealthNotice(layout: ConstraintLayout) {
+        val notice = LinearLayout(this).apply {
+            id = View.generateViewId()
+            orientation = LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER
+            setBackgroundColor(Color.BLACK)
+            isClickable = true
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        val declaration = TextView(this).apply {
+            text = "抵制不良游戏，拒绝盗版游戏。\n注意自我保护，谨防受骗上当。\n适度游戏益脑，沉迷游戏伤身。\n合理安排时间，享受健康生活。"
+            setTextColor(Color.WHITE)
+            gravity = android.view.Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            includeFontPadding = false
+        }
+        val title = TextView(this).apply {
+            text = "阿卡迪亚：传说 （by改服项目组）"
+            setTextColor(Color.WHITE)
+            gravity = android.view.Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            includeFontPadding = false
+            setPadding(0, dp(18), 0, 0)
+        }
+        notice.addView(declaration)
+        notice.addView(title)
+        layout.addView(
+            notice,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.MATCH_PARENT,
+                ConstraintLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+                endToEnd = ConstraintLayout.LayoutParams.PARENT_ID
+                topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+                bottomToBottom = ConstraintLayout.LayoutParams.PARENT_ID
+            }
+        )
+        notice.bringToFront()
+        Handler(Looper.getMainLooper()).postDelayed({
+            notice.visibility = View.GONE
+        }, HEALTH_NOTICE_MS)
     }
 
     private fun sendVirtualKey(tag: String) {
@@ -590,12 +813,18 @@ class PlayerActivity : GameActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         nativeInit { message ->
             Log.e("ruffle", "Handling panic: $message")
+            getSharedPreferences(CRASH_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_PENDING_CRASH, message)
+                .commit()
             startActivity(
                 Intent(this, PanicActivity::class.java).apply {
                     putExtra("message", message)
                 }
             )
         }
+        installCrashLogger()
+        volumeControlStream = AudioManager.STREAM_MUSIC
         // When true, the app will fit inside any system UI windows.
         // When false, we render behind any system UI windows.
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -607,6 +836,72 @@ class PlayerActivity : GameActivity() {
         requestNoStatusBarFeature()
         supportActionBar?.hide()
         super.onCreate(savedInstanceState)
+        KeepAliveService.start(this)
+    }
+
+    override fun onDestroy() {
+        if (isFinishing) {
+            KeepAliveService.stop(this)
+        }
+        super.onDestroy()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val direction = when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> AudioManager.ADJUST_RAISE
+            KeyEvent.KEYCODE_VOLUME_DOWN -> AudioManager.ADJUST_LOWER
+            else -> null
+        }
+        if (direction != null) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                audioManager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    direction,
+                    AudioManager.FLAG_SHOW_UI
+                )
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun installCrashLogger() {
+        if (crashLoggerInstalled) {
+            return
+        }
+        crashLoggerInstalled = true
+        val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            writeCrashLog(
+                "Java uncaught exception\n" +
+                    "Thread: ${thread.name}\n\n" +
+                    throwableStackTrace(throwable)
+            )
+            if (previousHandler != null) {
+                previousHandler.uncaughtException(thread, throwable)
+            } else {
+                exitProcess(2)
+            }
+        }
+    }
+
+    private fun throwableStackTrace(throwable: Throwable): String {
+        val writer = StringWriter()
+        throwable.printStackTrace(PrintWriter(writer))
+        return writer.toString()
+    }
+
+    private fun writeCrashLog(message: String) {
+        try {
+            val dir = File(getAndroidAppDataDir(), "errorlog")
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+            val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())
+            File(dir, "crash-$timestamp.log").writeText(message, Charsets.UTF_8)
+        } catch (error: Exception) {
+            Log.e("ruffle", "Failed to write crash log", error)
+        }
     }
 
     // Used by Rust
@@ -629,7 +924,11 @@ class PlayerActivity : GameActivity() {
     companion object {
         private const val PREFS_NAME = "ruffle_settings"
         private const val KEY_RENDER_BACKEND = "render_backend"
-        private const val RESTART_REQUEST_CODE = 7337
+        private const val KEY_RENDER_SCALE = "render_scale"
+        private const val CRASH_PREFS_NAME = "crash_logs"
+        private const val KEY_PENDING_CRASH = "pending_native_panic"
+        private const val HEALTH_NOTICE_MS = 1000L
+        private var crashLoggerInstalled = false
 
         init {
             // load the native activity

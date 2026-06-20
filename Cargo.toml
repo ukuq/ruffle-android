@@ -49,6 +49,7 @@ log = "0.4.32"
 tracing = {version = "0.1.44", features = ["log", "log-always"]}
 backtrace = "0.3.76"
 async-task = "4.7.1"
+async-channel = "2.5.0"
 
 url = "2.5.2"
 webbrowser = "1.1.0"
