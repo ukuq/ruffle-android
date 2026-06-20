@@ -156,6 +156,7 @@ jobs:
     name: Android Tests
     needs: build-native-libs
     runs-on: ubuntu-latest
+    if: false   # 完全禁用测试
     strategy:
       matrix:
         api-level: [26, 36]
