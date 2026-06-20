@@ -2800,6 +2800,7 @@ dependencies = [
  "ruffle_common",
  "ruffle_core",
  "ruffle_frontend_utils",
+ "ruffle_render",
  "ruffle_render_wgpu",
  "ruffle_video_software",
  "tokio",

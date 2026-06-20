@@ -39,6 +39,7 @@ ruffle_core = { path = "../ruffle/core", features = [
     "default_compatibility_rules",
     "default_font",
 ] }
+ruffle_render = { path = "../ruffle/render" }
 ruffle_render_wgpu = { path = "../ruffle/render/wgpu" }
 ruffle_video_software = { path = "../ruffle/video/software" }
 ruffle_frontend_utils = { path = "../ruffle/frontend-utils", default-features = false, features = ["fs", "navigator", "rustls-tls"] }

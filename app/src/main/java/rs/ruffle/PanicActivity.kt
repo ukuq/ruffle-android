@@ -75,20 +75,18 @@ class PanicActivity : Activity() {
         setContentView(container)
     }
 
-    private fun writeCrashLog(message: String): String? {
-        return try {
-            val root = getExternalFilesDir(null)?.parentFile ?: filesDir
-            val dir = File(root, "errorlog")
-            if (!dir.exists()) {
-                dir.mkdirs()
-            }
-            val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())
-            val file = File(dir, "crash-$timestamp.log")
-            file.writeText("Native panic\n\n$message", Charsets.UTF_8)
-            file.absolutePath
-        } catch (_: Exception) {
-            null
+    private fun writeCrashLog(message: String): String? = try {
+        val root = getExternalFilesDir(null)?.parentFile ?: filesDir
+        val dir = File(root, "errorlog")
+        if (!dir.exists()) {
+            dir.mkdirs()
         }
+        val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())
+        val file = File(dir, "crash-$timestamp.log")
+        file.writeText("Native panic\n\n$message", Charsets.UTF_8)
+        file.absolutePath
+    } catch (_: Exception) {
+        null
     }
 
     companion object {

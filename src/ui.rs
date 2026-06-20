@@ -4,13 +4,18 @@ use ruffle_core::backend::ui::{
     FullscreenError, LanguageIdentifier, MouseCursor, MultiDialogResultFuture,
     MultiFileDialogResult, UiBackend, US_ENGLISH,
 };
-use ruffle_core::font::{FontFileData, FontQuery};
+use ruffle_core::font::{FontFileData, FontMetrics, FontQuery, FontRenderer, Glyph};
+use ruffle_core::swf::Twips;
+use ruffle_render::bitmap::{Bitmap, BitmapFormat};
 use std::cell::RefCell;
+use std::convert::TryInto;
 use std::sync::Arc;
 use url::Url;
 
 use crate::get_jvm;
 use crate::java::JavaInterface;
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString, JValue, ReleaseMode};
+use jni::sys::{jboolean, JNI_FALSE, JNI_TRUE};
 
 #[derive(Clone)]
 struct AndroidFontSource {
@@ -87,6 +92,18 @@ impl UiBackend for AndroidUiBackend {
     fn display_unsupported_video(&self, _url: Url) {}
 
     fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
+        if let Some(font_renderer) =
+            AndroidCanvasFontRenderer::new(query.name.clone(), query.is_bold, query.is_italic)
+        {
+            register(FontDefinition::ExternalRenderer {
+                name: query.name.clone(),
+                is_bold: query.is_bold,
+                is_italic: query.is_italic,
+                font_renderer: Box::new(font_renderer),
+            });
+            return;
+        }
+
         if let Some(source) = self.font_source() {
             register(FontDefinition::FontFile {
                 name: query.name.clone(),
@@ -173,4 +190,283 @@ fn load_android_font_source() -> Option<AndroidFontSource> {
 
     log::warn!("No Android device font source found");
     None
+}
+
+#[derive(Debug)]
+struct AndroidCanvasFontRenderer {
+    family: String,
+    is_bold: bool,
+    is_italic: bool,
+    metrics: FontMetrics,
+}
+
+impl AndroidCanvasFontRenderer {
+    const SCALE: f32 = 64.0 * 20.0;
+    const GLYPH_HEADER_BYTES: usize = 20;
+
+    fn new(family: String, is_bold: bool, is_italic: bool) -> Option<Self> {
+        let metrics = android_font_metrics(&family, is_bold, is_italic)?;
+
+        Some(Self {
+            family,
+            is_bold,
+            is_italic,
+            metrics,
+        })
+    }
+}
+
+impl FontRenderer for AndroidCanvasFontRenderer {
+    fn scale(&self) -> f32 {
+        Self::SCALE
+    }
+
+    fn get_font_metrics(&self) -> FontMetrics {
+        self.metrics
+    }
+
+    fn has_kerning_info(&self) -> bool {
+        true
+    }
+
+    fn render_glyph(&self, character: char) -> Option<Glyph> {
+        let bytes = android_render_glyph(&self.family, self.is_bold, self.is_italic, character)?;
+        if bytes.len() < Self::GLYPH_HEADER_BYTES {
+            log::warn!("Android glyph renderer returned a truncated glyph");
+            return None;
+        }
+
+        let width = read_i32_le(&bytes, 0)?;
+        let height = read_i32_le(&bytes, 4)?;
+        let advance = read_i32_le(&bytes, 8)?;
+        let tx = read_i32_le(&bytes, 12)?;
+        let has_native_color = read_i32_le(&bytes, 16)? != 0;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+
+        let width = width as u32;
+        let height = height as u32;
+        let expected_len =
+            Self::GLYPH_HEADER_BYTES.checked_add(width as usize * height as usize * 4)?;
+        if bytes.len() != expected_len {
+            log::warn!(
+                "Android glyph renderer returned {} bytes, expected {expected_len}",
+                bytes.len()
+            );
+            return None;
+        }
+
+        let bitmap = Bitmap::new(
+            width,
+            height,
+            BitmapFormat::Rgba,
+            bytes[Self::GLYPH_HEADER_BYTES..].to_vec(),
+        );
+        Some(Glyph::from_bitmap_with_native_color(
+            character,
+            bitmap,
+            Twips::new(advance),
+            Twips::new(tx),
+            has_native_color,
+        ))
+    }
+
+    fn calculate_kerning(&self, left: char, right: char) -> Twips {
+        android_font_kerning(&self.family, self.is_bold, self.is_italic, left, right)
+            .map(Twips::new)
+            .unwrap_or(Twips::ZERO)
+    }
+}
+
+fn read_i32_le(bytes: &[u8], offset: usize) -> Option<i32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(i32::from_le_bytes(slice.try_into().ok()?))
+}
+
+fn android_bool(value: bool) -> jboolean {
+    if value {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+fn with_android_font_renderer<R>(
+    family: &str,
+    is_bold: bool,
+    is_italic: bool,
+    f: impl FnOnce(&mut jni::JNIEnv<'_>, JClass<'_>, JString<'_>, jboolean, jboolean) -> Option<R>,
+) -> Option<R> {
+    let (jvm, activity) = get_jvm().ok()?;
+    let mut env = jvm.attach_current_thread().ok()?;
+    let class = android_font_renderer_class(&mut env, &activity)?;
+    let family = env.new_string(family).ok()?;
+    f(
+        &mut env,
+        class,
+        family,
+        android_bool(is_bold),
+        android_bool(is_italic),
+    )
+}
+
+fn android_font_renderer_class<'local>(
+    env: &mut jni::JNIEnv<'local>,
+    activity: &JObject<'_>,
+) -> Option<JClass<'local>> {
+    let class_loader =
+        match env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]) {
+            Ok(value) => value.l().ok()?,
+            Err(error) => {
+                clear_pending_jni_exception(env, "getting Android class loader");
+                log::warn!("Failed to get Android class loader: {error}");
+                return None;
+            }
+        };
+    let class_name = env.new_string("rs.ruffle.AndroidFontRenderer").ok()?;
+    match env.call_method(
+        &class_loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValue::Object(&class_name)],
+    ) {
+        Ok(value) => value.l().ok().map(JClass::from),
+        Err(error) => {
+            clear_pending_jni_exception(env, "loading Android font renderer class");
+            log::warn!("Failed to load Android font renderer class: {error}");
+            None
+        }
+    }
+}
+
+fn clear_pending_jni_exception(env: &mut jni::JNIEnv<'_>, context: &str) {
+    match env.exception_check() {
+        Ok(true) => {
+            let _ = env.exception_clear();
+            log::warn!("Cleared Java exception while {context}");
+        }
+        Ok(false) => {}
+        Err(error) => log::warn!("Failed to check Java exception while {context}: {error}"),
+    }
+}
+
+fn android_font_metrics(family: &str, is_bold: bool, is_italic: bool) -> Option<FontMetrics> {
+    with_android_font_renderer(
+        family,
+        is_bold,
+        is_italic,
+        |env, class, family, is_bold, is_italic| {
+            let result = env
+                .call_static_method(
+                    class,
+                    "metrics",
+                    "(Ljava/lang/String;ZZ)[I",
+                    &[
+                        JValue::Object(&family),
+                        JValue::Bool(is_bold),
+                        JValue::Bool(is_italic),
+                    ],
+                )
+                .map_err(|error| {
+                    clear_pending_jni_exception(env, "calling Android font metrics");
+                    log::warn!("Failed to call Android font metrics: {error}");
+                })
+                .ok()?
+                .l()
+                .ok()?;
+            if result.is_null() {
+                return None;
+            }
+            let metrics = JIntArray::from(result);
+            let elements = unsafe {
+                env.get_array_elements(&metrics, ReleaseMode::NoCopyBack)
+                    .ok()?
+            };
+            if elements.len() < 3 {
+                return None;
+            }
+            Some(FontMetrics {
+                scale: AndroidCanvasFontRenderer::SCALE,
+                ascent: elements[0],
+                descent: elements[1],
+                leading: elements[2] as i16,
+            })
+        },
+    )
+}
+
+fn android_render_glyph(
+    family: &str,
+    is_bold: bool,
+    is_italic: bool,
+    character: char,
+) -> Option<Vec<u8>> {
+    with_android_font_renderer(
+        family,
+        is_bold,
+        is_italic,
+        |env, class, family, is_bold, is_italic| {
+            let codepoint = character as i32;
+            let result = env
+                .call_static_method(
+                    class,
+                    "renderGlyph",
+                    "(Ljava/lang/String;ZZI)[B",
+                    &[
+                        JValue::Object(&family),
+                        JValue::Bool(is_bold),
+                        JValue::Bool(is_italic),
+                        JValue::Int(codepoint),
+                    ],
+                )
+                .map_err(|error| {
+                    clear_pending_jni_exception(env, "calling Android glyph renderer");
+                    log::warn!("Failed to call Android glyph renderer: {error}");
+                })
+                .ok()?
+                .l()
+                .ok()?;
+            if result.is_null() {
+                return None;
+            }
+            let bytes = JByteArray::from(result);
+            env.convert_byte_array(bytes).ok()
+        },
+    )
+}
+
+fn android_font_kerning(
+    family: &str,
+    is_bold: bool,
+    is_italic: bool,
+    left: char,
+    right: char,
+) -> Option<i32> {
+    with_android_font_renderer(
+        family,
+        is_bold,
+        is_italic,
+        |env, class, family, is_bold, is_italic| {
+            env.call_static_method(
+                class,
+                "kerning",
+                "(Ljava/lang/String;ZZII)I",
+                &[
+                    JValue::Object(&family),
+                    JValue::Bool(is_bold),
+                    JValue::Bool(is_italic),
+                    JValue::Int(left as i32),
+                    JValue::Int(right as i32),
+                ],
+            )
+            .map_err(|error| {
+                clear_pending_jni_exception(env, "calling Android font kerning");
+                log::warn!("Failed to call Android font kerning: {error}");
+            })
+            .ok()?
+            .i()
+            .ok()
+        },
+    )
 }

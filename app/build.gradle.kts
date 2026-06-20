@@ -8,12 +8,22 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 val localProperties = gradleLocalProperties(rootDir, providers)
 val abiFilterList = ((localProperties["ABI_FILTERS"] ?: properties["ABI_FILTERS"]) as? String)
     ?.split(';')
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
 val ndkTargetList = ((localProperties["ndkTargets"] ?: properties["ndkTargets"]) as? String)
     ?.split(';')
     ?.map { it.trim() }
     ?.filter { it.isNotEmpty() }
-val defaultAbiFilters = listOf("arm64-v8a")
-val defaultNdkTargets = listOf("aarch64-linux-android")
+val isGithubActions = System.getenv("GITHUB_ACTIONS") != null
+val allAbiFilters = listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+val allNdkTargets = listOf(
+    "armv7-linux-androideabi",
+    "aarch64-linux-android",
+    "i686-linux-android",
+    "x86_64-linux-android"
+)
+val defaultAbiFilters = if (isGithubActions) allAbiFilters else listOf("arm64-v8a")
+val defaultNdkTargets = if (isGithubActions) allNdkTargets else listOf("aarch64-linux-android")
 val abiCodes = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86" to 3, "x86_64" to 4)
 
 plugins {
@@ -37,18 +47,20 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
-
     }
 
     signingConfigs {
-        val keyFile = file("androidkey.jks")
+        val keyFile = System.getenv("SIGNING_STORE_FILE")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { file(it) }
+            ?: file("androidkey.jks")
         val storePasswordVal = System.getenv("SIGNING_STORE_PASSWORD")
         if (keyFile.exists() && storePasswordVal != null && storePasswordVal.isNotEmpty()) {
             create("release") {
                 storeFile = keyFile
                 storePassword = storePasswordVal
                 keyAlias = System.getenv("SIGNING_KEY_ALIAS")
-                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: storePasswordVal
             }
         }
     }
