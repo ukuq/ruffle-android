@@ -23,7 +23,7 @@
         <activity
             android:name="rs.ruffle.MainActivity"
             android:launchMode="singleTask"
-            android:screenOrientation="landscape"
+            android:screenOrientation="sensorLandscape"
             android:exported="true">
 
             <intent-filter>
@@ -42,7 +42,7 @@
             android:exported="false"
             android:noHistory="true"
             android:process=":restart"
-            android:screenOrientation="landscape"
+            android:screenOrientation="sensorLandscape"
             android:taskAffinity="rs.seer2.restart">
         </activity>
         <service
@@ -56,7 +56,7 @@
             android:configChanges="colorMode|density|fontScale|keyboard|keyboardHidden|layoutDirection|locale|navigation|orientation|screenLayout|screenSize|smallestScreenSize|touchscreen|uiMode"
             android:launchMode="singleTask"
 
-            android:screenOrientation="landscape"
+            android:screenOrientation="sensorLandscape"
             android:windowSoftInputMode="adjustResize|stateAlwaysHidden"
             >
             <meta-data android:name="android.app.lib_name" android:value="ruffle_android" />
