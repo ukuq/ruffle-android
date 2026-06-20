@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.espresso.matcher.ViewMatchers.assertThat
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -13,6 +14,7 @@ import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import java.io.File
+import java.util.concurrent.TimeoutException
 import org.hamcrest.CoreMatchers.equalTo
 import org.hamcrest.CoreMatchers.notNullValue
 import org.junit.Before
@@ -21,6 +23,7 @@ import org.junit.runner.RunWith
 
 private const val BASIC_SAMPLE_PACKAGE = "rs.seer2"
 private const val LAUNCH_TIMEOUT = 5000L
+private const val TRACE_TIMEOUT = 30000L
 
 @RunWith(AndroidJUnit4::class)
 class SmokeTest {
@@ -72,10 +75,20 @@ class SmokeTest {
 
     @Test
     fun emulatorRunsASwf() {
-        device.waitForWindowUpdate(null, 1000)
+        waitUntilTraceOutput()
         assertThat(device, notNullValue())
 
         val trace = traceOutput.readLines()
         assertThat(trace, equalTo(listOf("Hello from Flash!")))
+    }
+
+    private fun waitUntilTraceOutput(timeoutMillis: Long = TRACE_TIMEOUT) {
+        val timeoutAt = SystemClock.uptimeMillis() + timeoutMillis
+        while (traceOutput.length() == 0L) {
+            if (SystemClock.uptimeMillis() >= timeoutAt) {
+                throw TimeoutException("No trace output was received within $timeoutMillis ms")
+            }
+            Thread.sleep(100)
+        }
     }
 }
