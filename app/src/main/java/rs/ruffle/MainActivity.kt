@@ -7,7 +7,19 @@ import android.app.Activity
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        startActivity(Intent(this, PlayerActivity::class.java))
+        val pendingCrash = getSharedPreferences(CRASH_PREFS_NAME, MODE_PRIVATE)
+            .getString(KEY_PENDING_CRASH, null)
+        val target = if (pendingCrash.isNullOrEmpty()) {
+            PlayerActivity::class.java
+        } else {
+            PanicActivity::class.java
+        }
+        startActivity(Intent(this, target))
         finish()
+    }
+
+    companion object {
+        private const val CRASH_PREFS_NAME = "crash_logs"
+        private const val KEY_PENDING_CRASH = "pending_native_panic"
     }
 }

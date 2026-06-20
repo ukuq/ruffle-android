@@ -12,6 +12,8 @@ val ndkTargetList = ((localProperties["ndkTargets"] ?: properties["ndkTargets"])
     ?.split(';')
     ?.map { it.trim() }
     ?.filter { it.isNotEmpty() }
+val defaultAbiFilters = listOf("arm64-v8a")
+val defaultNdkTargets = listOf("aarch64-linux-android")
 val abiCodes = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86" to 3, "x86_64" to 4)
 
 plugins {
@@ -25,7 +27,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "rs.ruffle"
+        applicationId = "rs.seer2"
         minSdk = 26
         targetSdk = 35
         versionCode = 1104
@@ -36,11 +38,6 @@ android {
             useSupportLibrary = true
         }
 
-        ndk {
-            if (abiFilterList == null) {
-                abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
-            }
-        }
     }
 
     signingConfigs {
@@ -95,10 +92,7 @@ android {
             if (abiFilterList != null && abiFilterList.isNotEmpty()) {
                 include(*abiFilterList.toTypedArray())
             } else {
-                include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-
-                // Specifies that we also want to generate a universal APK that includes all ABIs.
-                isUniversalApk = true
+                include(*defaultAbiFilters.toTypedArray())
             }
         }
     }
@@ -155,5 +149,7 @@ cargoNdk {
 
     if (!ndkTargetList.isNullOrEmpty()) {
         targets = ArrayList(ndkTargetList)
+    } else {
+        targets = ArrayList(defaultNdkTargets)
     }
 }

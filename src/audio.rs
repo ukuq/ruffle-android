@@ -56,11 +56,26 @@ impl AAudioAudioBackend {
     }
 
     pub fn recreate_stream_if_needed(&mut self) {
-        let stream_state = self.stream.as_ref().unwrap().state();
-        if stream_state == AudioStreamState::Disconnected {
-            // I'm sure it's fine...
-            let _ = self.recreate_stream();
+        let should_recreate = self
+            .stream
+            .as_ref()
+            .map(|stream| stream.state() == AudioStreamState::Disconnected)
+            .unwrap_or(true);
+
+        if should_recreate {
+            if let Err(error) = self.recreate_stream() {
+                log::warn!("Error recreating disconnected audio stream: {error}");
+                self.paused = true;
+            }
         }
+    }
+
+    pub fn resume_output(&mut self) {
+        <Self as AudioBackend>::play(self);
+    }
+
+    pub fn pause_output(&mut self) {
+        <Self as AudioBackend>::pause(self);
     }
 }
 
@@ -68,20 +83,35 @@ impl AudioBackend for AAudioAudioBackend {
     impl_audio_mixer_backend!(mixer);
 
     fn play(&mut self) {
-        self.stream
-            .as_mut()
-            .expect("Error trying to resume audio stream.")
-            .request_start()
-            .expect("Error trying to resume audio stream.");
         self.paused = false;
+
+        if self.stream.is_none() {
+            if let Err(error) = self.recreate_stream() {
+                log::warn!("Error recreating audio stream before resume: {error}");
+                self.paused = true;
+            }
+            return;
+        }
+
+        if let Some(stream) = self.stream.as_mut() {
+            if let Err(error) = stream.request_start() {
+                log::warn!("Error trying to resume audio stream: {error}; recreating stream");
+                self.stream = None;
+                if let Err(error) = self.recreate_stream() {
+                    log::warn!("Error recreating audio stream after resume failure: {error}");
+                    self.paused = true;
+                }
+            }
+        }
     }
 
     fn pause(&mut self) {
-        self.stream
-            .as_mut()
-            .expect("Error trying to pause audio stream.")
-            .request_pause()
-            .expect("Error trying to pause audio stream.");
         self.paused = true;
+
+        if let Some(stream) = self.stream.as_mut() {
+            if let Err(error) = stream.request_pause() {
+                log::warn!("Error trying to pause audio stream: {error}");
+            }
+        }
     }
 }

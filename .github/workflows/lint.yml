@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Checkout Ruffle dependency
+        run: |
+          rm -rf ../ruffle
+          git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
+
       - name: Install Rust toolchain
         run: |
           rustup show
@@ -44,6 +49,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Checkout Ruffle dependency
+        run: |
+          rm -rf ../ruffle
+          git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5

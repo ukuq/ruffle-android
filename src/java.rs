@@ -162,6 +162,13 @@ impl JavaInterface {
         backend
     }
 
+    pub fn get_render_scale(env: &mut JNIEnv, this: &JObject) -> f32 {
+        env.call_method(this, "getRenderScale", "()F", &[])
+            .expect("getRenderScale() must never throw")
+            .f()
+            .unwrap_or(1.0)
+    }
+
     pub fn show_load_failure(env: &mut JNIEnv, this: &JObject, message: &str) {
         let java_message = env.new_string(message).unwrap();
         let result = env.call_method(
@@ -206,6 +213,17 @@ impl JavaInterface {
             &[(&java_text).into()],
         );
         result.expect("updateServerMetrics() must never throw");
+    }
+
+    pub fn update_fps(env: &mut JNIEnv, this: &JObject, text: &str) {
+        let java_text = env.new_string(text).unwrap();
+        let result = env.call_method(
+            this,
+            "updateFps",
+            "(Ljava/lang/String;)V",
+            &[(&java_text).into()],
+        );
+        result.expect("updateFps() must never throw");
     }
 
     pub fn get() -> &'static JavaInterface {

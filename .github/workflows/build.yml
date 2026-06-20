@@ -34,6 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Checkout Ruffle dependency
+        run: |
+          rm -rf ../ruffle
+          git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
+
       - name: Install Rust toolchain
         run: |
           rustup show
@@ -81,6 +86,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Checkout Ruffle dependency
+        run: |
+          rm -rf ../ruffle
+          git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
 
       - uses: actions/download-artifact@v8
         with: # no name set, so all artifacts are downloaded
@@ -153,6 +163,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Checkout Ruffle dependency
+        run: |
+          rm -rf ../ruffle
+          git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
+
       - uses: actions/download-artifact@v8
         with: # no name set, so all artifacts are downloaded
           path: native-libs
@@ -201,7 +216,7 @@ jobs:
           arch: x86_64
           script: |
             adb shell settings put secure immersive_mode_confirmations confirmed
-            ./gradlew connectedCheck
+            ./gradlew connectedCheck -PABI_FILTERS=x86_64
 
       - name: Upload Test Report
         uses: actions/upload-artifact@v7

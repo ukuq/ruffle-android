@@ -2789,6 +2789,7 @@ version = "1.1.4"
 dependencies = [
  "android-activity",
  "android_logger",
+ "async-channel",
  "async-task",
  "backtrace",
  "base64",

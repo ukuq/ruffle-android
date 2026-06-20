@@ -16,6 +16,7 @@ use jni::{
 };
 use keycodes::{android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor};
 use std::any::Any;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, MutexGuard};
@@ -38,9 +39,10 @@ use url::Url;
 
 use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
-    backend::navigator::OwnedFuture,
+    backend::navigator::{FetchReason, OwnedFuture, Request},
     events::{LogicalKey, MouseButton, PlayerEvent},
     font::DefaultFont,
+    tag_utils::SwfMovie,
     Player, PlayerBuilder, StageAlign, StageScaleMode, ViewportDimensions,
 };
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
@@ -50,7 +52,7 @@ use ruffle_frontend_utils::{
     content::ContentDescriptor,
 };
 
-use crate::navigator::AndroidNavigatorInterface;
+use crate::navigator::{AndroidNavigatorBackend, AndroidNavigatorInterface};
 use crate::trace::FileLogBackend;
 use crate::ui::AndroidUiBackend;
 use java::JavaInterface;
@@ -161,14 +163,233 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for AndroidExecutor {
     }
 }
 
+fn create_active_player(
+    app: &AndroidApp,
+    window: &ndk::native_window::NativeWindow,
+    server: &seer2::HttpServer,
+    event_loop: EventSender,
+    android_storage_dir: &Path,
+    trace_output: Option<&Path>,
+    render_backend: RenderBackendPreference,
+    render_scale: f64,
+) -> ActivePlayer {
+    let dimensions = viewport_dimensions(app, window, render_scale);
+    let renderer = unsafe {
+        WgpuRenderBackend::for_window_unsafe(
+            wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                raw_window_handle: window.window_handle().unwrap().into(),
+            },
+            (dimensions.width, dimensions.height),
+            render_backend.backends(),
+            wgpu::PowerPreference::HighPerformance,
+        )
+        .unwrap()
+    };
+    let movie_url = server.movie_url();
+    let movie_url_parsed = Url::parse(&movie_url).unwrap();
+    let player_id = PlayerId::new();
+
+    let future_spawner = AndroidExecutor {
+        event_loop,
+        player_id,
+    };
+
+    let navigator = AndroidNavigatorBackend::new(ExternalNavigatorBackend::new(
+        movie_url_parsed.clone(),
+        None,
+        None,
+        future_spawner,
+        None,
+        false,
+        Default::default(),
+        ruffle_core::backend::navigator::SocketMode::Allow,
+        Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
+            movie_url_parsed,
+        ))),
+        AndroidNavigatorInterface,
+    ));
+
+    let active_player = ActivePlayer {
+        id: player_id,
+        player: PlayerBuilder::new()
+            .with_renderer(renderer)
+            .with_audio(AAudioAudioBackend::new().unwrap())
+            .with_storage(Box::new(DiskStorageBackend::new(
+                android_storage_dir.to_path_buf(),
+            )))
+            .with_ui(AndroidUiBackend::new())
+            .with_navigator(navigator)
+            .with_log(FileLogBackend::new(trace_output))
+            .with_video(ruffle_video_software::backend::SoftwareVideoBackend::new())
+            .with_letterbox(ruffle_core::config::Letterbox::On)
+            .with_align(StageAlign::empty(), true)
+            .with_scale_mode(StageScaleMode::ShowAll, true)
+            .with_fullscreen(true)
+            .build(),
+    };
+
+    {
+        let mut player_lock = active_player.player.lock().unwrap();
+        set_android_default_fonts(&mut player_lock);
+        player_lock.fetch_root_movie(movie_url, Vec::new(), Box::new(|_| {}));
+        player_lock.set_is_playing(true);
+        player_lock.set_letterbox(ruffle_core::config::Letterbox::On);
+        player_lock.set_viewport_dimensions(dimensions);
+    }
+
+    active_player
+}
+
+fn load_replacement_root_movie<'gc>(
+    uc: &ruffle_core::context::UpdateContext<'gc>,
+    movie_url: String,
+) -> OwnedFuture<(), ruffle_core::loader::Error> {
+    let player = uc.player_handle();
+
+    Box::pin(async move {
+        let fetch = player
+            .lock()
+            .unwrap()
+            .fetch(Request::get(movie_url), FetchReason::LoadSwf);
+        let response = fetch.await.map_err(|error| {
+            player
+                .lock()
+                .unwrap()
+                .ui()
+                .display_root_movie_download_failed_message(false, error.error.to_string());
+            error.error
+        })?;
+        let swf_url = response.url().into_owned();
+        let body = response.body().await.map_err(|error| {
+            player
+                .lock()
+                .unwrap()
+                .ui()
+                .display_root_movie_download_failed_message(true, error.to_string());
+            error
+        })?;
+
+        let spoofed_or_swf_url = player
+            .lock()
+            .unwrap()
+            .spoofed_url()
+            .map(|url| url.to_string())
+            .unwrap_or(swf_url);
+
+        let movie = SwfMovie::from_data(&body, spoofed_or_swf_url, None).map_err(|error| {
+            player
+                .lock()
+                .unwrap()
+                .ui()
+                .display_root_movie_download_failed_message(true, error.to_string());
+            ruffle_core::loader::Error::InvalidSwf(error)
+        })?;
+
+        let mut player_lock = player.lock().unwrap();
+        player_lock.set_is_playing(false);
+        player_lock.mutate_with_update_context(|uc| {
+            uc.replace_root_movie(movie);
+        });
+        player_lock.set_is_playing(true);
+        Ok(())
+    })
+}
+
+fn recreate_player_surface(
+    app: &AndroidApp,
+    active_player: &ActivePlayer,
+    window: &ndk::native_window::NativeWindow,
+    render_scale: f64,
+    resume_playback: bool,
+) -> bool {
+    if window.width() <= 0 || window.height() <= 0 {
+        log::warn!(
+            "Skipping surface recreation for invalid window size: {} x {}",
+            window.width(),
+            window.height()
+        );
+        return false;
+    }
+
+    let raw_window_handle = match window.window_handle() {
+        Ok(handle) => handle.into(),
+        Err(error) => {
+            log::warn!("Skipping surface recreation; window handle unavailable: {error:?}");
+            return false;
+        }
+    };
+
+    let mut player_lock = match active_player.player.lock() {
+        Ok(player) => player,
+        Err(error) => {
+            log::warn!("Skipping surface recreation; player lock is poisoned: {error}");
+            return false;
+        }
+    };
+
+    let Some(renderer) =
+        <dyn Any>::downcast_mut::<WgpuRenderBackend<SwapChainTarget>>(player_lock.renderer_mut())
+    else {
+        log::warn!("Skipping surface recreation; renderer backend type is unexpected");
+        return false;
+    };
+
+    let result = unsafe {
+        renderer.recreate_surface_unsafe(
+            wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                raw_window_handle,
+            },
+            render_surface_size(window, render_scale),
+        )
+    };
+
+    if let Err(error) = result {
+        log::warn!("Failed to recreate render surface: {error:?}");
+        return false;
+    }
+
+    player_lock.set_viewport_dimensions(viewport_dimensions(app, window, render_scale));
+    if resume_playback {
+        player_lock.set_is_playing(true);
+    }
+
+    true
+}
+
+fn set_audio_output(active_player: &ActivePlayer, enabled: bool) {
+    let mut player_lock = match active_player.player.lock() {
+        Ok(player) => player,
+        Err(error) => {
+            log::warn!("Skipping audio output change; player lock is poisoned: {error}");
+            return;
+        }
+    };
+
+    let Some(audio) = <dyn Any>::downcast_mut::<AAudioAudioBackend>(player_lock.audio_mut()) else {
+        log::warn!("Skipping audio output change; audio backend type is unexpected");
+        return;
+    };
+
+    if enabled {
+        audio.resume_output();
+    } else {
+        audio.pause_output();
+    }
+}
+
 #[tokio::main]
 async fn run(app: AndroidApp) {
     let mut last_frame_time = Instant::now();
     let mut next_frame_time = Some(Instant::now());
+    let mut fps_frame_count = 0_u32;
+    let mut fps_last_time = Instant::now();
     let mut quit = false;
     let (sender, receiver) = mpsc::channel::<RuffleEvent>();
     let mut native_window: Option<ndk::native_window::NativeWindow> = None;
     let mut playerbox: Option<ActivePlayer> = None;
+    let mut app_resumed = true;
     let sender = EventSender {
         sender,
         waker: app.create_waker(),
@@ -179,6 +400,7 @@ async fn run(app: AndroidApp) {
     let android_storage_dir;
     let android_app_data_dir;
     let render_backend;
+    let render_scale;
 
     unsafe {
         let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut sys::JavaVM).expect("JVM must exist");
@@ -191,9 +413,12 @@ async fn run(app: AndroidApp) {
             &mut jni_env,
             &activity,
         ));
+        render_scale =
+            sanitize_render_scale(JavaInterface::get_render_scale(&mut jni_env, &activity));
         let _ = jni_env.set_rust_field(activity, "eventLoopHandle", sender.clone());
     }
     log::info!("Render backend preference: {}", render_backend.key());
+    log::info!("Render resolution scale: {:.2}", render_scale);
 
     let load_failure_notifier: seer2::LoadFailureNotifier =
         Arc::new(|message| show_load_failure(&message));
@@ -218,312 +443,222 @@ async fn run(app: AndroidApp) {
 
     while !quit {
         let mut needs_redraw = false;
-        app.poll_events(
-            Some(
-                next_frame_time
-                    .and_then(|next| next.checked_duration_since(last_frame_time))
-                    .unwrap_or_else(|| Duration::from_millis(100)),
-            ),
-            |event| {
-                match event {
-                    PollEvent::Main(event) => match event {
-                        MainEvent::Destroy => {
-                            if let Some(player) = playerbox.as_ref() {
-                                let mut player_lock = player.player.lock().unwrap();
+        let can_tick = playerbox.is_some();
+        let poll_timeout = if can_tick {
+            next_frame_time
+                .and_then(|next| next.checked_duration_since(last_frame_time))
+                .unwrap_or_else(|| Duration::from_millis(100))
+        } else {
+            Duration::from_millis(100)
+        };
+        app.poll_events(Some(poll_timeout), |event| {
+            match event {
+                PollEvent::Main(event) => match event {
+                    MainEvent::Destroy => {
+                        if let Some(player) = playerbox.as_ref() {
+                            if let Ok(mut player_lock) = player.player.lock() {
                                 player_lock.flush_shared_objects();
                             }
-                            quit = true;
                         }
-                        MainEvent::WindowResized { .. } => {
-                            if let Some(player) = playerbox.as_ref() {
-                                let mut player_lock = player.player.lock().unwrap();
-                                let window = native_window
-                                    .as_ref()
-                                    .expect("native_window should be Some for a WindowResized");
-                                log::info!(
-                                    "WindowResized: {} x {}",
-                                    window.width(),
-                                    window.height()
-                                );
-                                let viewport_scale_factor = app
-                                    .config()
-                                    .density()
-                                    .map(|dpi| dpi as f64 / 160.0)
-                                    .unwrap_or(1.0);
-                                let dimensions = ViewportDimensions {
-                                    width: window.width() as u32,
-                                    height: window.height() as u32,
-                                    scale_factor: viewport_scale_factor,
-                                };
-                                player_lock.set_viewport_dimensions(dimensions);
-                                needs_redraw = true;
-                            }
-                        }
-                        MainEvent::Resume { .. } => {
-                            if let Some(player) = playerbox.as_ref() {
-                                if let Some(window) = native_window.as_ref() {
-                                    // [NA] For some reason we can get negative sizes during a resume...
-                                    if window.width() > 0 && window.height() > 0 {
-                                        unsafe {
-                                            let mut player = player
-                                                .player
-                                                .lock()
-                                                .unwrap();
-
-                                            let renderer = <dyn Any>::downcast_mut::<WgpuRenderBackend<SwapChainTarget>>(
-                                                player.renderer_mut(),
-                                            )
-                                            .unwrap();
-
-                                            renderer.recreate_surface_unsafe(
-                                                wgpu::SurfaceTargetUnsafe::RawHandle {
-                                                    raw_display_handle:
-                                                        RawDisplayHandle::Android(
-                                                            AndroidDisplayHandle::new(),
-                                                        ),
-                                                    raw_window_handle: window
-                                                        .window_handle()
-                                                        .unwrap()
-                                                        .into(),
-                                                },
-                                                (window.width() as u32, window.height() as u32),
-                                            )
-                                            .unwrap();
-                                        }
-                                    }
+                        quit = true;
+                    }
+                    MainEvent::WindowResized { .. } => {
+                        if let Some(player) = playerbox.as_ref() {
+                            if let Some(window) = native_window.as_ref() {
+                                if let Ok(mut player_lock) = player.player.lock() {
+                                    log::info!(
+                                        "WindowResized: {} x {}",
+                                        window.width(),
+                                        window.height()
+                                    );
+                                    let dimensions =
+                                        viewport_dimensions(&app, window, render_scale);
+                                    player_lock.set_viewport_dimensions(dimensions);
+                                    needs_redraw = true;
                                 }
-                            }
-                        }
-                        MainEvent::InitWindow { .. } => {
-                            native_window = app.native_window();
-                            let window = native_window
-                                .as_ref()
-                                .expect("native_window should be Some after InitWindow");
-                            let viewport_scale_factor = app
-                                .config()
-                                .density()
-                                .map(|dpi| dpi as f64 / 160.0)
-                                .unwrap_or(1.0);
-                            let dimensions = ViewportDimensions {
-                                width: window.width() as u32,
-                                height: window.height() as u32,
-                                scale_factor: viewport_scale_factor,
-                            };
-                            log::info!(
-                                "Init window: {} x {} (is existing: {})",
-                                window.width(),
-                                window.height(),
-                                playerbox.is_some()
-                            );
-
-                            if let Some(activeplayer) = &playerbox {
-                                let mut player_lock = activeplayer.player.lock().unwrap();
-                                unsafe {
-                                    let renderer = <dyn Any>::downcast_mut::<WgpuRenderBackend<SwapChainTarget>>(
-                                        player_lock.renderer_mut(),
-                                    )
-                                    .unwrap();
-
-                                    renderer.recreate_surface_unsafe(
-                                        wgpu::SurfaceTargetUnsafe::RawHandle {
-                                            raw_display_handle: RawDisplayHandle::Android(
-                                                AndroidDisplayHandle::new(),
-                                            ),
-                                            raw_window_handle: window
-                                                .window_handle()
-                                                .unwrap()
-                                                .into(),
-                                        },
-                                        (window.width() as u32, window.height() as u32),
-                                    )
-                                    .unwrap();
-                                }
-                                player_lock.set_is_playing(true);
-                            } else if let Some(seer2_server) = seer2_server.as_ref() {
-                                let renderer = unsafe {
-                                    // TODO: make this take an Arc<Window> instead?
-                                    WgpuRenderBackend::for_window_unsafe(
-                                        wgpu::SurfaceTargetUnsafe::RawHandle {
-                                            raw_display_handle: RawDisplayHandle::Android(
-                                                AndroidDisplayHandle::new(),
-                                            ),
-                                            raw_window_handle: window
-                                                .window_handle()
-                                                .unwrap()
-                                                .into(),
-                                        },
-                                        (dimensions.width, dimensions.height),
-                                        render_backend.backends(),
-                                        wgpu::PowerPreference::HighPerformance,
-                                    )
-                                    .unwrap()
-                                };
-                                let movie_url = Url::parse(&seer2_server.movie_url()).unwrap();
-                                let player_id = PlayerId::new();
-
-                                let future_spawner = AndroidExecutor {
-                                    event_loop: sender.clone(),
-                                    player_id,
-                                };
-
-                                let navigator = ExternalNavigatorBackend::new(
-                                    movie_url.clone(),
-                                    None,
-                                    None,
-                                    future_spawner,
-                                    None,
-                                    false,
-                                    Default::default(),
-                                    ruffle_core::backend::navigator::SocketMode::Allow,
-                                    Rc::new(PlayingContent::DirectFile(
-                                        ContentDescriptor::new_remote(movie_url.clone()),
-                                    )),
-                                    AndroidNavigatorInterface,
-                                );
-
-                                playerbox = Some(ActivePlayer {
-                                    id: player_id,
-                                    player: PlayerBuilder::new()
-                                            .with_renderer(renderer)
-                                            .with_audio(AAudioAudioBackend::new().unwrap())
-                                            .with_storage(Box::new(DiskStorageBackend::new(android_storage_dir.clone())))
-                                            .with_ui(AndroidUiBackend::new())
-                                            .with_navigator(navigator)
-                                            .with_log(FileLogBackend::new(trace_output.as_deref()))
-                                            .with_video(
-                                                ruffle_video_software::backend::SoftwareVideoBackend::new(),
-                                            )
-                                            .with_letterbox(ruffle_core::config::Letterbox::On)
-                                            .with_align(StageAlign::empty(), true)
-                                            .with_scale_mode(StageScaleMode::ShowAll, true)
-                                            .with_fullscreen(true)
-                                        .build(),
-                                    }
-                                );
-
-                                let player = &playerbox.as_ref().unwrap().player;
-                                let mut player_lock = player.lock().unwrap();
-                                set_android_default_fonts(&mut player_lock);
-                                player_lock.fetch_root_movie(
-                                    movie_url.to_string(),
-                                    Vec::new(),
-                                    Box::new(|_| {}),
-                                );
-                                player_lock.set_is_playing(true); // Desktop player will auto-play.
-
-                                player_lock.set_letterbox(ruffle_core::config::Letterbox::On);
-
-                                player_lock.set_viewport_dimensions(dimensions);
-
-                                last_frame_time = Instant::now();
-                                next_frame_time = Some(Instant::now());
-
-                                log::info!("MOVIE STARTED");
                             } else {
-                                log::warn!("Seer2 local server is unavailable; player not started");
+                                log::warn!("Ignoring WindowResized without a native window");
                             }
                         }
-                        MainEvent::TerminateWindow { .. }  => {
-                            let player = &playerbox.as_ref().unwrap().player;
-                            let mut player_lock = player.lock().unwrap();
-                            player_lock.set_is_playing(false);
+                    }
+                    MainEvent::Resume { .. } => {
+                        app_resumed = true;
+                        last_frame_time = Instant::now();
+                        next_frame_time = Some(last_frame_time);
+                        if let Some(player) = playerbox.as_ref() {
+                            if let Some(window) = native_window.as_ref() {
+                                needs_redraw |= recreate_player_surface(
+                                    &app,
+                                    player,
+                                    window,
+                                    render_scale,
+                                    false,
+                                );
+                                set_audio_output(player, true);
+                            }
                         }
-                        MainEvent::InputAvailable => {
-                            if let Ok(mut inputs) = app.input_events_iter() {
-                                while inputs.next(|input| match input {
-                                    InputEvent::MotionEvent(event) => {
-                                        let window = native_window.as_ref().unwrap();
-                                        let pointer = event.pointer_index();
-                                        let pointer = event.pointer_at_index(pointer);
-                                        let coords: (i32, i32) = get_loc_in_window();
-                                        let mut x = pointer.x() as f64 - coords.0 as f64;
-                                        let mut y = pointer.y() as f64 - coords.1 as f64;
-                                        let view_size = get_view_size().unwrap();
-                                        x = x * window.width() as f64 / view_size.0 as f64;
-                                        y = y * window.height() as f64 / view_size.1 as f64;
+                    }
+                    MainEvent::Pause | MainEvent::Stop => {
+                        app_resumed = false;
+                        if let Some(player) = playerbox.as_ref() {
+                            set_audio_output(player, false);
+                        }
+                    }
+                    MainEvent::InitWindow { .. } => {
+                        native_window = app.native_window();
+                        let Some(window) = native_window.as_ref() else {
+                            log::warn!("Ignoring InitWindow because native_window is unavailable");
+                            return;
+                        };
+                        let dimensions = viewport_dimensions(&app, window, render_scale);
+                        log::info!(
+                            "Init window: {} x {} -> render {} x {} (is existing: {})",
+                            window.width(),
+                            window.height(),
+                            dimensions.width,
+                            dimensions.height,
+                            playerbox.is_some()
+                        );
+
+                        if let Some(activeplayer) = &playerbox {
+                            last_frame_time = Instant::now();
+                            next_frame_time = Some(last_frame_time);
+                            needs_redraw |= recreate_player_surface(
+                                &app,
+                                activeplayer,
+                                window,
+                                render_scale,
+                                app_resumed,
+                            );
+                            if app_resumed {
+                                set_audio_output(activeplayer, true);
+                            }
+                        } else if let Some(seer2_server) = seer2_server.as_ref() {
+                            playerbox = Some(create_active_player(
+                                &app,
+                                window,
+                                seer2_server,
+                                sender.clone(),
+                                &android_storage_dir,
+                                trace_output.as_deref(),
+                                render_backend,
+                                render_scale,
+                            ));
+                            last_frame_time = Instant::now();
+                            next_frame_time = Some(Instant::now());
+
+                            log::info!("MOVIE STARTED");
+                        } else {
+                            log::warn!("Seer2 local server is unavailable; player not started");
+                        }
+                    }
+                    MainEvent::TerminateWindow { .. } => {
+                        if let Some(player) = playerbox.as_ref() {
+                            set_audio_output(player, false);
+                        }
+                        native_window = None;
+                    }
+                    MainEvent::InputAvailable => {
+                        if let Ok(mut inputs) = app.input_events_iter() {
+                            while inputs.next(|input| match input {
+                                InputEvent::MotionEvent(event) => {
+                                    let Some(window) = native_window.as_ref() else {
+                                        return InputStatus::Unhandled;
+                                    };
+                                    let pointer = event.pointer_index();
+                                    let pointer = event.pointer_at_index(pointer);
+                                    let coords: (i32, i32) = get_loc_in_window();
+                                    let mut x = pointer.x() as f64 - coords.0 as f64;
+                                    let mut y = pointer.y() as f64 - coords.1 as f64;
+                                    let Ok(view_size) = get_view_size() else {
+                                        return InputStatus::Unhandled;
+                                    };
+                                    let (render_width, render_height) =
+                                        render_surface_size(window, render_scale);
+                                    x = x * render_width as f64 / view_size.0 as f64;
+                                    y = y * render_height as f64 / view_size.1 as f64;
+                                    let ruffle_event = match event.action() {
+                                        MotionAction::Down
+                                        | MotionAction::PointerDown
+                                        | MotionAction::ButtonPress => {
+                                            PlayerEvent::MouseDown {
+                                                x,
+                                                y,
+                                                button: MouseButton::Left, // TODO
+                                                index: None,               // TODO
+                                            }
+                                        }
+                                        MotionAction::Up
+                                        | MotionAction::PointerUp
+                                        | MotionAction::ButtonRelease => {
+                                            PlayerEvent::MouseUp {
+                                                x,
+                                                y,
+                                                button: MouseButton::Left, // TODO
+                                            }
+                                        }
+                                        MotionAction::Move => PlayerEvent::MouseMove { x, y },
+                                        _ => return InputStatus::Unhandled,
+                                    };
+
+                                    if let Some(player) = playerbox.as_ref() {
+                                        player.player.lock().unwrap().handle_event(ruffle_event);
+                                    }
+
+                                    InputStatus::Handled
+                                }
+                                InputEvent::KeyEvent(event) => {
+                                    if let Some(player) = playerbox.as_ref() {
+                                        let Some(key_descriptor) =
+                                            android_key_event_to_ruffle_key_descriptor(event)
+                                        else {
+                                            return InputStatus::Unhandled;
+                                        };
+                                        let down;
                                         let ruffle_event = match event.action() {
-                                            MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
-                                                PlayerEvent::MouseDown {
-                                                    x,
-                                                    y,
-                                                    button: MouseButton::Left, // TODO
-                                                    index: None, // TODO
+                                            KeyAction::Down => {
+                                                down = true;
+                                                PlayerEvent::KeyDown {
+                                                    key: key_descriptor,
                                                 }
                                             }
-                                            MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
-                                                PlayerEvent::MouseUp {
-                                                    x,
-                                                    y,
-                                                    button: MouseButton::Left, // TODO
+                                            KeyAction::Up => {
+                                                down = false;
+                                                PlayerEvent::KeyUp {
+                                                    key: key_descriptor,
                                                 }
                                             }
-                                            MotionAction::Move => PlayerEvent::MouseMove { x, y },
                                             _ => return InputStatus::Unhandled,
                                         };
+                                        player.player.lock().unwrap().handle_event(ruffle_event);
 
-                                        if let Some(player) = playerbox.as_ref() {
-                                            player
-                                                .player
-                                                .lock()
-                                                .unwrap()
-                                                .handle_event(ruffle_event);
-                                        }
+                                        // TODO: Use `KeyEvent.unicode_char` when it's available:
+                                        // https://github.com/rust-mobile/android-activity/issues/183
+                                        if down {
+                                            if let LogicalKey::Character(c) =
+                                                key_descriptor.logical_key
+                                            {
+                                                let event = PlayerEvent::TextInput { codepoint: c };
+                                                player.player.lock().unwrap().handle_event(event);
+                                            }
+                                        };
 
-                                        InputStatus::Handled
+                                        needs_redraw = true;
                                     }
-                                    InputEvent::KeyEvent(event) => {
-                                        if let Some(player) = playerbox.as_ref() {
-                                            let Some(key_descriptor) =
-                                                android_key_event_to_ruffle_key_descriptor(event)
-                                            else {
-                                                return InputStatus::Unhandled;
-                                            };
-                                            let down;
-                                            let ruffle_event = match event.action() {
-                                                KeyAction::Down => {
-                                                    down = true;
-                                                    PlayerEvent::KeyDown {
-                                                        key: key_descriptor,
-                                                    }
-                                                }
-                                                KeyAction::Up => {
-                                                    down = false;
-                                                    PlayerEvent::KeyUp { key: key_descriptor }
-                                                }
-                                                _ => return InputStatus::Unhandled,
-                                            };
-                                            player
-                                                .player
-                                                .lock()
-                                                .unwrap()
-                                                .handle_event(ruffle_event);
 
-                                            // TODO: Use `KeyEvent.unicode_char` when it's available:
-                                            // https://github.com/rust-mobile/android-activity/issues/183
-                                            if down {
-                                                if let LogicalKey::Character(c) = key_descriptor.logical_key {
-                                                    let event = PlayerEvent::TextInput { codepoint: c };
-                                                    player.player.lock().unwrap().handle_event(event);
-                                                }
-                                            };
-
-                                            needs_redraw = true;
-                                        }
-
-                                        InputStatus::Handled
-                                    }
-                                    _ => InputStatus::Unhandled,
-                                }) {}
-                            }
+                                    InputStatus::Handled
+                                }
+                                _ => InputStatus::Unhandled,
+                            }) {}
                         }
-                        _ => {} // Something else happened but it's probably not important for now.
-                    },
-                    PollEvent::Wake => {} // A task tried to wake us, we'll recv it below
-                    PollEvent::Timeout => {} // No events happened, we'll tick as normal below
-                    _ => {}               // Unknown future event
-                }
-            },
-        );
+                    }
+                    _ => {} // Something else happened but it's probably not important for now.
+                },
+                PollEvent::Wake => {} // A task tried to wake us, we'll recv it below
+                PollEvent::Timeout => {} // No events happened, we'll tick as normal below
+                _ => {}               // Unknown future event
+            }
+        });
 
         match receiver.try_recv() {
             Err(_) => {}
@@ -593,11 +728,30 @@ async fn run(app: AndroidApp) {
                     JavaInterface::show_context_menu(&mut env, &activity, &items);
                 }
             }
+            Ok(RuffleEvent::ReloadMovie) => {
+                if let (Some(player), Some(server)) = (playerbox.as_ref(), seer2_server.as_ref()) {
+                    log::info!("Replacing root Flash movie");
+                    let movie_url = server.movie_url();
+                    player
+                        .player
+                        .lock()
+                        .unwrap()
+                        .mutate_with_update_context(|uc| {
+                            let future = load_replacement_root_movie(uc, movie_url);
+                            uc.navigator.spawn_future(future);
+                        });
+                    needs_redraw = true;
+                } else {
+                    log::warn!("Ignoring Flash reload request before player is ready");
+                }
+            }
         }
 
         let new_time = Instant::now();
         let dt = new_time.duration_since(last_frame_time).as_micros();
-        if dt > 0 {
+        let can_tick = playerbox.is_some();
+        let can_render = app_resumed && native_window.is_some();
+        if can_tick && dt > 0 {
             last_frame_time = new_time;
             if let Some(player) = playerbox.as_ref() {
                 if let Ok(mut player) = player.player.lock() {
@@ -613,12 +767,24 @@ async fn run(app: AndroidApp) {
             }
         }
 
-        if needs_redraw {
+        let mut rendered_frame = false;
+        if can_render && needs_redraw {
             if let Some(player) = playerbox.as_ref() {
                 if let Ok(mut player) = player.player.lock() {
                     player.render();
+                    rendered_frame = true;
                 }
             }
+        }
+        if rendered_frame {
+            fps_frame_count += 1;
+        }
+        let fps_elapsed = new_time.duration_since(fps_last_time);
+        if fps_elapsed >= Duration::from_secs(1) {
+            let fps = fps_frame_count as f64 / fps_elapsed.as_secs_f64();
+            update_fps(&format!("FPS:{fps:.0}"));
+            fps_frame_count = 0;
+            fps_last_time = new_time;
         }
     }
 
@@ -649,9 +815,8 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_commitText(
         return;
     }
 
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::TextInput(text));
+    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
+    event_loop.send(RuffleEvent::TextInput(text));
 }
 
 #[no_mangle]
@@ -666,10 +831,9 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydown(
         .expect("Couldn't get java string!")
         .into();
 
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = key_tag_to_key_descriptor(&tag) {
-        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
+        event_loop.send(RuffleEvent::VirtualKeyEvent {
             down: true,
             key_descriptor: desc,
         });
@@ -688,10 +852,9 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyup(
         .expect("Couldn't get java string!")
         .into();
 
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = key_tag_to_key_descriptor(&tag) {
-        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
+        event_loop.send(RuffleEvent::VirtualKeyEvent {
             down: false,
             key_descriptor: desc,
         });
@@ -741,6 +904,54 @@ fn update_server_metrics(text: &str) {
     }
 }
 
+fn update_fps(text: &str) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => JavaInterface::update_fps(&mut env, &activity, text),
+            Err(err) => log::error!("Failed to attach JVM for FPS overlay: {}", err),
+        },
+        Err(err) => log::error!("Failed to get JVM for FPS overlay: {}", err),
+    }
+}
+
+fn sanitize_render_scale(scale: f32) -> f64 {
+    if scale.is_finite() {
+        f64::from(scale).clamp(0.25, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn viewport_dimensions(
+    app: &AndroidApp,
+    window: &ndk::native_window::NativeWindow,
+    render_scale: f64,
+) -> ViewportDimensions {
+    let (width, height) = render_surface_size(window, render_scale);
+    let scale_factor = app
+        .config()
+        .density()
+        .map(|dpi| dpi as f64 / 160.0)
+        .unwrap_or(1.0);
+
+    ViewportDimensions {
+        width,
+        height,
+        scale_factor: scale_factor * render_scale,
+    }
+}
+
+fn render_surface_size(window: &ndk::native_window::NativeWindow, render_scale: f64) -> (u32, u32) {
+    (
+        scaled_window_dimension(window.width(), render_scale),
+        scaled_window_dimension(window.height(), render_scale),
+    )
+}
+
+fn scaled_window_dimension(value: i32, render_scale: f64) -> u32 {
+    ((value.max(1) as f64 * render_scale).round() as u32).max(1)
+}
+
 fn set_android_default_fonts(player: &mut Player) {
     let names = vec![
         "Android CJK".to_string(),
@@ -762,9 +973,8 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_requestContextMenu(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::RequestContextMenu);
+    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
+    event_loop.send(RuffleEvent::RequestContextMenu);
 }
 
 #[no_mangle]
@@ -774,9 +984,8 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_runContextMenuCallback(
     this: JObject,
     index: jint,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::RunContextMenuCallback(index as usize));
+    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
+    event_loop.send(RuffleEvent::RunContextMenuCallback(index as usize));
 }
 
 #[no_mangle]
@@ -785,9 +994,19 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_clearContextMenu(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::ClearContextMenu);
+    let event_loop: MutexGuard<EventSender> = env.get_rust_field(this, "eventLoopHandle").unwrap();
+    event_loop.send(RuffleEvent::ClearContextMenu);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_reloadGame(mut env: JNIEnv, this: JObject) {
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::ReloadMovie),
+        Err(error) => log::warn!("Ignoring reload request before event loop is ready: {error:?}"),
+    }
 }
 
 #[no_mangle]

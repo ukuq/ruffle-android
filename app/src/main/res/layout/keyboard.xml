@@ -416,16 +416,22 @@
             android:id="@+id/button_kb"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:background="@android:color/transparent"
+            android:backgroundTint="@android:color/transparent"
             android:tag="kb"
-            android:text="⌨" />
+            android:text="⌨"
+            android:textColor="@android:color/white" />
 
         <Button
             android:id="@+id/button_cm"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:background="@android:color/transparent"
+            android:backgroundTint="@android:color/transparent"
             android:checkable="true"
             android:tag="cm"
-            android:text="▤" />
+            android:text="▤"
+            android:textColor="@android:color/white" />
 
     </LinearLayout>
 
