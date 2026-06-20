@@ -118,6 +118,8 @@ class PlayerActivity : GameActivity() {
     private lateinit var renderBackendButton: TextView
     private lateinit var renderScaleButton: TextView
     private lateinit var stageQualityButton: TextView
+    private var imeWasVisible = false
+    private var consumeImeDismissTouch = false
     private val audioManager: AudioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
@@ -262,6 +264,23 @@ class PlayerActivity : GameActivity() {
         mSurfaceView.contentDescription = "Ruffle Player"
         mSurfaceView.isFocusable = true
         mSurfaceView.isFocusableInTouchMode = true
+        mSurfaceView.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && imeWasVisible) {
+                consumeImeDismissTouch = true
+                hideVirtualKeyboardDeferred()
+                true
+            } else if (consumeImeDismissTouch) {
+                if (
+                    event.actionMasked == MotionEvent.ACTION_UP ||
+                    event.actionMasked == MotionEvent.ACTION_CANCEL
+                ) {
+                    consumeImeDismissTouch = false
+                }
+                true
+            } else {
+                false
+            }
+        }
 
         val placeholder = findViewById<View>(R.id.placeholder)
         val pars = placeholder.layoutParams as ConstraintLayout.LayoutParams
@@ -287,11 +306,11 @@ class PlayerActivity : GameActivity() {
         serverMetricsView = TextView(this).apply {
             text = "hit:0\nexpired:0\nfetch:0\ncached:0\nchecked:0"
             setTextColor(Color.WHITE)
-            setBackgroundColor(0x66000000)
+            setBackgroundColor(Color.TRANSPARENT)
             typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             includeFontPadding = false
-            setPadding(dp(6), dp(4), dp(6), dp(4))
+            setPadding(0, 0, 0, 0)
             isClickable = false
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -642,14 +661,19 @@ class PlayerActivity : GameActivity() {
             imm.hideSoftInputFromWindow(ruffleInputView.windowToken, 0)
             WindowInsetsControllerCompat(window, ruffleInputView)
                 .hide(WindowInsetsCompat.Type.ime())
-            ruffleInputView.isFocusable = false
-            ruffleInputView.isFocusableInTouchMode = false
-            mSurfaceView.requestFocus()
+            imeWasVisible = false
+            releaseVirtualKeyboardFocus()
         }
     }
 
     private fun applyImeInsets(insets: WindowInsetsCompat) {
         val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+        if (imeVisible) {
+            imeWasVisible = true
+        } else if (imeWasVisible) {
+            imeWasVisible = false
+            releaseVirtualKeyboardFocus()
+        }
         val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
         val bottomMargin = if (imeVisible) imeBottom else 0
         val params = mSurfaceView.layoutParams as? ConstraintLayout.LayoutParams ?: return
@@ -658,6 +682,16 @@ class PlayerActivity : GameActivity() {
             mSurfaceView.layoutParams = params
         }
         updateServerMetricsBottomMargin(bottomMargin)
+    }
+
+    private fun releaseVirtualKeyboardFocus() {
+        if (!::ruffleInputView.isInitialized) {
+            return
+        }
+        ruffleInputView.clearFocus()
+        ruffleInputView.isFocusable = false
+        ruffleInputView.isFocusableInTouchMode = false
+        mSurfaceView.requestFocus()
     }
 
     private fun updateServerMetricsBottomMargin(bottomInset: Int) {
@@ -675,11 +709,11 @@ class PlayerActivity : GameActivity() {
     private fun overlayTextView(initialText: String): TextView = TextView(this).apply {
         text = initialText
         setTextColor(Color.WHITE)
-        setBackgroundColor(0x66000000)
+        setBackgroundColor(Color.TRANSPARENT)
         typeface = Typeface.MONOSPACE
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
         includeFontPadding = false
-        setPadding(dp(6), dp(3), dp(6), dp(3))
+        setPadding(0, 0, 0, 0)
         isClickable = false
         isFocusable = false
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
