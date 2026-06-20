@@ -19,7 +19,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 
-private const val BASIC_SAMPLE_PACKAGE = "rs.ruffle"
+private const val BASIC_SAMPLE_PACKAGE = "rs.seer2"
 private const val LAUNCH_TIMEOUT = 5000L
 
 @RunWith(AndroidJUnit4::class)
@@ -54,14 +54,12 @@ class SmokeTest {
         )
         val bytes = inStream.readBytes()
         swfFile.writeBytes(bytes)
-        val intent = context.packageManager.getLaunchIntentForPackage(
-            BASIC_SAMPLE_PACKAGE
-        )?.apply {
-            component = ComponentName("rs.ruffle", "rs.ruffle.PlayerActivity")
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            component = ComponentName(BASIC_SAMPLE_PACKAGE, "rs.ruffle.PlayerActivity")
             data = Uri.fromFile(swfFile)
             putExtra("traceOutput", traceOutput.absolutePath)
             // Clear out any previous instances
-            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
         context.startActivity(intent)
 
