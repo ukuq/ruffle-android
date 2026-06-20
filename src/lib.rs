@@ -61,6 +61,7 @@ use ruffle_render::quality::StageQuality;
 use ruffle_render_wgpu::{backend::WgpuRenderBackend, target::SwapChainTarget};
 
 thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
     static SUPPRESS_PANIC_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -200,17 +201,30 @@ where
     })
 }
 
-fn create_active_player(
-    app: &AndroidApp,
-    window: &ndk::native_window::NativeWindow,
-    server: &seer2::HttpServer,
+struct ActivePlayerConfig<'a> {
+    server: &'a seer2::HttpServer,
     event_loop: EventSender,
-    android_storage_dir: &Path,
-    trace_output: Option<&Path>,
+    android_storage_dir: &'a Path,
+    trace_output: Option<&'a Path>,
     render_backend: RenderBackendPreference,
     render_scale: f64,
     stage_quality: StageQuality,
+}
+
+fn create_active_player(
+    app: &AndroidApp,
+    window: &ndk::native_window::NativeWindow,
+    config: ActivePlayerConfig<'_>,
 ) -> Result<ActivePlayer, String> {
+    let ActivePlayerConfig {
+        server,
+        event_loop,
+        android_storage_dir,
+        trace_output,
+        render_backend,
+        render_scale,
+        stage_quality,
+    } = config;
     let dimensions = viewport_dimensions_for_backend(app, window, render_backend, render_scale);
     let renderer = create_render_backend(window, dimensions, render_backend)?;
     let movie_url = server.movie_url();
@@ -349,13 +363,12 @@ fn load_replacement_root_movie<'gc>(
             error.error
         })?;
         let swf_url = response.url().into_owned();
-        let body = response.body().await.map_err(|error| {
+        let body = response.body().await.inspect_err(|error| {
             if let Ok(player) = player.lock() {
                 player
                     .ui()
                     .display_root_movie_download_failed_message(true, error.to_string());
             }
-            error
         })?;
 
         let spoofed_or_swf_url = match player.lock() {
@@ -668,13 +681,15 @@ async fn run(app: AndroidApp) {
                             match create_active_player(
                                 &app,
                                 window,
-                                seer2_server,
-                                sender.clone(),
-                                &android_storage_dir,
-                                trace_output.as_deref(),
-                                render_backend,
-                                render_scale,
-                                stage_quality,
+                                ActivePlayerConfig {
+                                    server: seer2_server,
+                                    event_loop: sender.clone(),
+                                    android_storage_dir: &android_storage_dir,
+                                    trace_output: trace_output.as_deref(),
+                                    render_backend,
+                                    render_scale,
+                                    stage_quality,
+                                },
                             ) {
                                 Ok(active_player) => {
                                     playerbox = Some(active_player);
@@ -1158,7 +1173,7 @@ pub fn get_jvm<'a>() -> Result<(jni::JavaVM, JObject<'a>), Box<dyn std::error::E
             "android context is not initialized: {}",
             panic_payload_message(payload.as_ref())
         );
-        std::io::Error::new(std::io::ErrorKind::Other, message)
+        std::io::Error::other(message)
     })?;
     let activity = unsafe { JObject::from_raw(context.context().cast()) };
     let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }?;
