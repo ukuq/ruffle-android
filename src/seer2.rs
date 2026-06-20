@@ -671,7 +671,7 @@ fn fetch_and_cache(
             if is_critical_game_path(url_path) {
                 notify_game_load_failure(&state, format!("{LOAD_FAILED_PREFIX}\n{err}"));
             }
-            return Err(err.into());
+            return Err(err);
         }
     };
     let status = remote.status;
