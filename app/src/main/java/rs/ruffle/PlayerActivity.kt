@@ -33,6 +33,11 @@ import android.view.inputmethod.ExtractedText
 import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -119,6 +124,7 @@ class PlayerActivity : GameActivity() {
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
     private external fun reloadGame()
+    private external fun externalInterfaceCallback(name: String, payload: String)
     private external fun setHoverClickMode(enabled: Boolean)
 
     private lateinit var ruffleInputView: RuffleInputView
@@ -131,6 +137,8 @@ class PlayerActivity : GameActivity() {
     private lateinit var stageQualityButton: TextView
     private lateinit var hoverClickButton: TextView
     private lateinit var noMovieBackgroundView: View
+    private var webLoginDialog: AlertDialog? = null
+    private var webLoginView: WebView? = null
     private var imeWasVisible = false
     private var consumeImeDismissTouch = false
     private var hoverClickModeEnabled = false
@@ -286,6 +294,138 @@ class PlayerActivity : GameActivity() {
                 return@runOnUiThread
             }
             noMovieBackgroundView.visibility = if (visible) View.VISIBLE else View.GONE
+        }
+    }
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun openWebLogin(url: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) {
+                return@runOnUiThread
+            }
+            showWebLogin(url)
+        }
+    }
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun handleExternalInterfaceCall(name: String, args: String, url: String?) {
+        Log.i("ruffle", "ExternalInterface.call name=$name args=$args url=$url")
+        if (!url.isNullOrBlank()) {
+            openWebLogin(url)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun showWebLogin(url: String) {
+        webLoginDialog?.dismiss()
+        webLoginView?.destroy()
+
+        val webView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.cacheMode = WebSettings.LOAD_DEFAULT
+            if (Build.VERSION.SDK_INT >= VERSION_CODES.LOLLIPOP) {
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            }
+            addJavascriptInterface(WebLoginBridge(), "RuffleAndroid")
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): Boolean {
+                    Log.i("ruffle", "Web login URL: ${request.url}")
+                    return false
+                }
+
+                @Suppress("DEPRECATION")
+                override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
+                    Log.i("ruffle", "Web login URL: $url")
+                    return false
+                }
+
+                override fun onPageFinished(view: WebView, url: String) {
+                    super.onPageFinished(view, url)
+                    view.evaluateJavascript(webLoginBridgeScript(), null)
+                }
+            }
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                webView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    resources.displayMetrics.heightPixels - dp(96)
+                )
+            )
+        }
+
+        webLoginView = webView
+        webLoginDialog = AlertDialog.Builder(this)
+            .setTitle("\u767b\u5f55")
+            .setView(container)
+            .setNegativeButton("\u5173\u95ed", null)
+            .create()
+            .apply {
+                setOnDismissListener {
+                    webLoginView?.destroy()
+                    webLoginView = null
+                    webLoginDialog = null
+                }
+                show()
+            }
+
+        webView.loadUrl(url)
+    }
+
+    private fun webLoginBridgeScript(): String =
+        """
+        (function() {
+            if (window.__ruffleAndroidBridgeInstalled) {
+                return;
+            }
+            window.__ruffleAndroidBridgeInstalled = true;
+            function toPayload(value) {
+                if (typeof value === 'string') {
+                    return value;
+                }
+                try {
+                    return JSON.stringify(value);
+                } catch (error) {
+                    return String(value);
+                }
+            }
+            function send(name, payload) {
+                if (window.RuffleAndroid && window.RuffleAndroid.postMessage) {
+                    window.RuffleAndroid.postMessage(String(name), toPayload(payload));
+                }
+            }
+            window.ruffleAndroidCallback = send;
+            window.SeerAndroidCallback = send;
+            window.TaomeeAndroidCallback = send;
+            window.external = window.external || {};
+            if (!window.external.call) {
+                window.external.call = send;
+            }
+        })();
+        """.trimIndent()
+
+    private inner class WebLoginBridge {
+        @JavascriptInterface
+        fun postMessage(name: String, payload: String?) {
+            val safePayload = payload ?: ""
+            Log.i("ruffle", "Web login callback name=$name payload=$safePayload")
+            externalInterfaceCallback(name, safePayload)
+        }
+
+        @JavascriptInterface
+        fun close() {
+            runOnUiThread {
+                webLoginDialog?.dismiss()
+            }
         }
     }
 
@@ -1066,6 +1206,7 @@ class PlayerActivity : GameActivity() {
         notice.bringToFront()
         Handler(Looper.getMainLooper()).postDelayed({
             notice.visibility = View.GONE
+            requestSurfaceFocusIfReady()
         }, HEALTH_NOTICE_MS)
     }
 
@@ -1298,6 +1439,7 @@ class PlayerActivity : GameActivity() {
     override fun onResume() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        requestSurfaceFocusIfReady()
     }
 
     override fun onPause() {
@@ -1328,8 +1470,92 @@ class PlayerActivity : GameActivity() {
             }
             return true
         }
+        if (shouldDispatchHardwareKeyToRuffle() && dispatchHardwareKeyToRuffle(event)) {
+            return true
+        }
         return super.dispatchKeyEvent(event)
     }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            requestSurfaceFocusIfReady()
+        }
+    }
+
+    private fun shouldDispatchHardwareKeyToRuffle(): Boolean {
+        if (mSurfaceView == null || webLoginDialog?.isShowing == true) {
+            return false
+        }
+        return currentFocus !is EditText
+    }
+
+    private fun requestSurfaceFocusIfReady() {
+        mSurfaceView?.requestFocus()
+    }
+
+    private fun dispatchHardwareKeyToRuffle(event: KeyEvent): Boolean {
+        val keyTag = hardwareKeyTag(event.keyCode) ?: return false
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> keydown(keyTag)
+            KeyEvent.ACTION_UP -> keyup(keyTag)
+            else -> return false
+        }
+        return true
+    }
+
+    private fun hardwareKeyTag(keyCode: Int): String? =
+        when (keyCode) {
+            KeyEvent.KEYCODE_A -> "A"
+            KeyEvent.KEYCODE_B -> "B"
+            KeyEvent.KEYCODE_C -> "C"
+            KeyEvent.KEYCODE_D -> "D"
+            KeyEvent.KEYCODE_E -> "E"
+            KeyEvent.KEYCODE_F -> "F"
+            KeyEvent.KEYCODE_G -> "G"
+            KeyEvent.KEYCODE_H -> "H"
+            KeyEvent.KEYCODE_I -> "I"
+            KeyEvent.KEYCODE_J -> "J"
+            KeyEvent.KEYCODE_K -> "K"
+            KeyEvent.KEYCODE_L -> "L"
+            KeyEvent.KEYCODE_M -> "M"
+            KeyEvent.KEYCODE_N -> "N"
+            KeyEvent.KEYCODE_O -> "O"
+            KeyEvent.KEYCODE_P -> "P"
+            KeyEvent.KEYCODE_Q -> "Q"
+            KeyEvent.KEYCODE_R -> "R"
+            KeyEvent.KEYCODE_S -> "S"
+            KeyEvent.KEYCODE_T -> "T"
+            KeyEvent.KEYCODE_U -> "U"
+            KeyEvent.KEYCODE_V -> "V"
+            KeyEvent.KEYCODE_W -> "W"
+            KeyEvent.KEYCODE_X -> "X"
+            KeyEvent.KEYCODE_Y -> "Y"
+            KeyEvent.KEYCODE_Z -> "Z"
+            KeyEvent.KEYCODE_0 -> "0"
+            KeyEvent.KEYCODE_1 -> "1"
+            KeyEvent.KEYCODE_2 -> "2"
+            KeyEvent.KEYCODE_3 -> "3"
+            KeyEvent.KEYCODE_4 -> "4"
+            KeyEvent.KEYCODE_5 -> "5"
+            KeyEvent.KEYCODE_6 -> "6"
+            KeyEvent.KEYCODE_7 -> "7"
+            KeyEvent.KEYCODE_8 -> "8"
+            KeyEvent.KEYCODE_9 -> "9"
+            KeyEvent.KEYCODE_DPAD_UP -> "UP"
+            KeyEvent.KEYCODE_DPAD_DOWN -> "DOWN"
+            KeyEvent.KEYCODE_DPAD_LEFT -> "LEFT"
+            KeyEvent.KEYCODE_DPAD_RIGHT -> "RIGHT"
+            KeyEvent.KEYCODE_SPACE -> "SPACE"
+            KeyEvent.KEYCODE_DEL -> "BACKSPACE"
+            KeyEvent.KEYCODE_ENTER -> "ENTER"
+            KeyEvent.KEYCODE_NUMPAD_ENTER -> "ENTER"
+            KeyEvent.KEYCODE_ALT_LEFT -> "ALT"
+            KeyEvent.KEYCODE_ALT_RIGHT -> "ALT"
+            KeyEvent.KEYCODE_CTRL_LEFT -> "CTRL"
+            KeyEvent.KEYCODE_CTRL_RIGHT -> "CTRL"
+            else -> null
+        }
 
     private fun installCrashLogger() {
         if (crashLoggerInstalled) {

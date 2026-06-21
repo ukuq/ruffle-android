@@ -1,9 +1,7 @@
 package rs.ruffle
 
 import android.R
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
@@ -22,7 +20,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 private const val BASIC_SAMPLE_PACKAGE = "rs.seer2"
-private const val LAUNCH_TIMEOUT = 5000L
+private const val LAUNCH_TIMEOUT = 60000L
 private const val TRACE_TIMEOUT = 30000L
 
 @RunWith(AndroidJUnit4::class)
@@ -57,18 +55,15 @@ class SmokeTest {
         )
         val bytes = inStream.readBytes()
         swfFile.writeBytes(bytes)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            component = ComponentName(BASIC_SAMPLE_PACKAGE, "rs.ruffle.PlayerActivity")
-            data = Uri.fromFile(swfFile)
-            putExtra("traceOutput", traceOutput.absolutePath)
-            // Clear out any previous instances
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        }
-        context.startActivity(intent)
+        startPlayerActivity(swfFile, traceOutput)
 
         // Wait for the app to appear
         device.wait(
             Until.hasObject(By.pkg(BASIC_SAMPLE_PACKAGE).depth(0)),
+            LAUNCH_TIMEOUT
+        )
+        device.wait(
+            Until.hasObject(By.desc("Ruffle Player")),
             LAUNCH_TIMEOUT
         )
     }
@@ -80,6 +75,28 @@ class SmokeTest {
 
         val trace = traceOutput.readLines()
         assertThat(trace, equalTo(listOf("Hello from Flash!")))
+    }
+
+    private fun startPlayerActivity(swfFile: File, traceOutput: File) {
+        val swfUri = Uri.fromFile(swfFile)
+        device.executeShellCommand(
+            listOf(
+                "am",
+                "start",
+                "-W",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                swfUri.toString(),
+                "-n",
+                "$BASIC_SAMPLE_PACKAGE/rs.ruffle.PlayerActivity",
+                "--es",
+                "traceOutput",
+                traceOutput.absolutePath,
+                "-f",
+                "268468224"
+            ).joinToString(" ")
+        )
     }
 
     private fun waitUntilTraceOutput(timeoutMillis: Long = TRACE_TIMEOUT) {

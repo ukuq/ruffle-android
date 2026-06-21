@@ -42,6 +42,7 @@ use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
     backend::navigator::{FetchReason, OwnedFuture, Request},
     events::{LogicalKey, MouseButton, PlayerEvent, TextControlCode},
+    external::{ExternalInterfaceProvider, Value as ExternalValue},
     font::DefaultFont,
     tag_utils::SwfMovie,
     Player, PlayerBuilder, StageAlign, StageScaleMode, ViewportDimensions,
@@ -201,6 +202,117 @@ where
     })
 }
 
+struct AndroidExternalInterfaceProvider;
+
+impl ExternalInterfaceProvider for AndroidExternalInterfaceProvider {
+    fn call_method(
+        &self,
+        _context: &mut ruffle_core::context::UpdateContext<'_>,
+        name: &str,
+        args: &[ExternalValue],
+    ) -> ExternalValue {
+        let args_json = external_values_to_json(args);
+        let url = find_external_url(name, args);
+        log::info!("ExternalInterface.call: {name} {args_json}");
+        handle_external_interface_call(name, &args_json, url.as_deref());
+        ExternalValue::Undefined
+    }
+
+    fn on_callback_available(&self, name: &str) {
+        log::info!("ExternalInterface callback registered: {name}");
+    }
+
+    fn get_id(&self) -> Option<String> {
+        Some("ruffle_android".to_string())
+    }
+}
+
+fn external_values_to_json(values: &[ExternalValue]) -> String {
+    let mut output = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&external_value_to_json(value));
+    }
+    output.push(']');
+    output
+}
+
+fn external_value_to_json(value: &ExternalValue) -> String {
+    match value {
+        ExternalValue::Undefined | ExternalValue::Null => "null".to_string(),
+        ExternalValue::Bool(value) => value.to_string(),
+        ExternalValue::Number(value) => value.to_string(),
+        ExternalValue::String(value) => json_quote(value),
+        ExternalValue::List(values) => external_values_to_json(values),
+        ExternalValue::Object(values) => {
+            let mut output = String::from("{");
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&json_quote(key));
+                output.push(':');
+                output.push_str(&external_value_to_json(value));
+            }
+            output.push('}');
+            output
+        }
+    }
+}
+
+fn json_quote(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn find_external_url(name: &str, args: &[ExternalValue]) -> Option<String> {
+    find_url_in_text(name).or_else(|| args.iter().find_map(find_external_value_url))
+}
+
+fn find_external_value_url(value: &ExternalValue) -> Option<String> {
+    match value {
+        ExternalValue::String(value) => find_url_in_text(value),
+        ExternalValue::List(values) => values.iter().find_map(find_external_value_url),
+        ExternalValue::Object(values) => values.iter().find_map(|(key, value)| {
+            find_url_in_text(key).or_else(|| find_external_value_url(value))
+        }),
+        _ => None,
+    }
+}
+
+fn find_url_in_text(text: &str) -> Option<String> {
+    ["https://", "http://"].iter().find_map(|scheme| {
+        let start = text.find(scheme)?;
+        let tail = &text[start..];
+        let end = tail
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '[' | ']')
+            })
+            .unwrap_or(tail.len());
+        let url = tail[..end]
+            .trim_end_matches([',', ';', ')', '}'])
+            .to_string();
+        if url.is_empty() {
+            None
+        } else {
+            Some(url)
+        }
+    })
+}
+
 struct ActivePlayerConfig<'a> {
     movie_url: &'a str,
     event_loop: EventSender,
@@ -267,6 +379,7 @@ fn create_active_player(
             )))
             .with_ui(AndroidUiBackend::new())
             .with_navigator(navigator)
+            .with_external_interface(Box::new(AndroidExternalInterfaceProvider))
             .with_log(FileLogBackend::new(trace_output))
             .with_video(ruffle_video_software::backend::SoftwareVideoBackend::new())
             .with_letterbox(ruffle_core::config::Letterbox::On)
@@ -1002,6 +1115,28 @@ async fn run(app: AndroidApp) {
                         log::warn!("Ignoring Flash reload request before player is ready");
                     }
                 }
+                RuffleEvent::ExternalInterfaceCallback { name, payload } => {
+                    if let Some(player) = playerbox.as_ref() {
+                        match player.player.lock() {
+                            Ok(mut player) => {
+                                log::info!(
+                                    "Calling ExternalInterface callback {name} with {payload}"
+                                );
+                                let _ = player.call_internal_interface(
+                                    &name,
+                                    [ExternalValue::String(payload)],
+                                );
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Skipping ExternalInterface callback; player lock is poisoned: {error}"
+                                );
+                            }
+                        }
+                    } else {
+                        log::warn!("Ignoring ExternalInterface callback before player is ready");
+                    }
+                }
                 RuffleEvent::SetHoverClickMode(enabled) => {
                     hover_click_mode = enabled;
                     log::info!("Hover click mode: {enabled}");
@@ -1221,6 +1356,28 @@ fn show_load_failure(message: &str) {
     }
 }
 
+pub(crate) fn open_web_login_url(url: &str) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => JavaInterface::open_web_login(&mut env, &activity, url),
+            Err(err) => log::error!("Failed to attach JVM for web login: {}", err),
+        },
+        Err(err) => log::error!("Failed to get JVM for web login: {}", err),
+    }
+}
+
+fn handle_external_interface_call(name: &str, args: &str, url: Option<&str>) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => {
+                JavaInterface::handle_external_interface_call(&mut env, &activity, name, args, url)
+            }
+            Err(err) => log::error!("Failed to attach JVM for ExternalInterface: {}", err),
+        },
+        Err(err) => log::error!("Failed to get JVM for ExternalInterface: {}", err),
+    }
+}
+
 fn set_no_movie_background_visible(visible: bool) {
     match get_jvm() {
         Ok((jvm, activity)) => match jvm.attach_current_thread() {
@@ -1415,6 +1572,41 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setHoverClickMode(
         Ok(event_loop) => event_loop.send(RuffleEvent::SetHoverClickMode(enabled != 0)),
         Err(error) => {
             log::warn!("Ignoring hover click mode change before event loop is ready: {error:?}");
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_externalInterfaceCallback(
+    mut env: JNIEnv,
+    this: JObject,
+    name: JString,
+    payload: JString,
+) {
+    let callback_name = match env.get_string(&name) {
+        Ok(name) => name.to_string_lossy().to_string(),
+        Err(error) => {
+            log::warn!("Ignoring ExternalInterface callback with invalid name: {error}");
+            return;
+        }
+    };
+    let payload = match env.get_string(&payload) {
+        Ok(payload) => payload.to_string_lossy().to_string(),
+        Err(error) => {
+            log::warn!("Ignoring ExternalInterface callback with invalid payload: {error}");
+            return;
+        }
+    };
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::ExternalInterfaceCallback {
+            name: callback_name,
+            payload,
+        }),
+        Err(error) => {
+            log::warn!("Ignoring ExternalInterface callback before event loop is ready: {error:?}");
         }
     }
 }

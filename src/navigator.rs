@@ -47,7 +47,33 @@ impl<F: FutureSpawner<Error> + 'static> NavigatorBackend for AndroidNavigatorBac
         target: &str,
         vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     ) {
-        self.inner.navigate_to_url(url, target, vars_method);
+        let mut parsed_url = match self.resolve_url(url) {
+            Ok(url) => url,
+            Err(error) => {
+                log::warn!("Could not parse navigation URL {url:?}: {error}");
+                return;
+            }
+        };
+
+        if let Some((_, query_pairs)) = vars_method {
+            let mut modifier = parsed_url.query_pairs_mut();
+            for (key, value) in query_pairs.iter() {
+                modifier.append_pair(key, value);
+            }
+        }
+
+        if parsed_url.scheme() == "javascript" {
+            log::info!("Ignoring javascript navigation request: {parsed_url}");
+            return;
+        }
+
+        log::info!("Opening web URL target={target}: {parsed_url}");
+        match parsed_url.scheme() {
+            "http" | "https" => crate::open_web_login_url(parsed_url.as_ref()),
+            _ => self
+                .inner
+                .navigate_to_url(parsed_url.as_ref(), target, None),
+        }
     }
 
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {

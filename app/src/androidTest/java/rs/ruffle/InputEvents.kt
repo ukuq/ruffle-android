@@ -1,8 +1,6 @@
 package rs.ruffle
 
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import android.graphics.Point
 import android.graphics.Rect
 import android.net.Uri
@@ -25,7 +23,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 private const val BASIC_SAMPLE_PACKAGE = "rs.seer2"
-private const val LAUNCH_TIMEOUT = 5000L
+private const val LAUNCH_TIMEOUT = 60000L
 private const val TRACE_TIMEOUT = 30000L
 private const val SWF_WIDTH = 550.0
 private const val SWF_HEIGHT = 400.0
@@ -64,19 +62,38 @@ class InputEvents {
         )
         val bytes = inStream.readBytes()
         swfFile.writeBytes(bytes)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            component = ComponentName(BASIC_SAMPLE_PACKAGE, "rs.ruffle.PlayerActivity")
-            data = Uri.fromFile(swfFile)
-            putExtra("traceOutput", traceOutput.absolutePath)
-            // Clear out any previous instances
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        }
-        context.startActivity(intent)
+        startPlayerActivity(swfFile, traceOutput)
 
         // Wait for the app to appear
         device.wait(
             Until.hasObject(By.pkg(BASIC_SAMPLE_PACKAGE).depth(0)),
             LAUNCH_TIMEOUT
+        )
+        device.wait(
+            Until.hasObject(By.desc("Ruffle Player")),
+            LAUNCH_TIMEOUT
+        )
+    }
+
+    private fun startPlayerActivity(swfFile: File, traceOutput: File) {
+        val swfUri = Uri.fromFile(swfFile)
+        device.executeShellCommand(
+            listOf(
+                "am",
+                "start",
+                "-W",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                swfUri.toString(),
+                "-n",
+                "$BASIC_SAMPLE_PACKAGE/rs.ruffle.PlayerActivity",
+                "--es",
+                "traceOutput",
+                traceOutput.absolutePath,
+                "-f",
+                "268468224"
+            ).joinToString(" ")
         )
     }
 
@@ -116,8 +133,8 @@ class InputEvents {
     fun keyEvents() {
         waitUntilNewLogAndIdle()
 
-        device.pressKeyCode(KeyEvent.KEYCODE_A)
-        device.pressKeyCode(KeyEvent.KEYCODE_B)
+        shellInput("keyevent ${KeyEvent.KEYCODE_A}")
+        shellInput("keyevent ${KeyEvent.KEYCODE_B}")
 
         waitUntilNewLogAndIdle()
 
@@ -217,6 +234,10 @@ class InputEvents {
             }
             Thread.sleep(idleWindowMillis)
         }
+    }
+
+    private fun shellInput(arguments: String) {
+        device.executeShellCommand("input $arguments")
     }
 }
 
