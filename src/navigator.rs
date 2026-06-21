@@ -13,6 +13,42 @@ use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
+pub(crate) fn find_web_url_in_text(text: &str) -> Option<String> {
+    ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| {
+            let start = text.find(scheme)?;
+            Some(trim_embedded_url(&text[start..]).to_string())
+        })
+        .filter(|url| !url.is_empty())
+        .or_else(|| find_protocol_relative_web_url(text))
+}
+
+fn find_protocol_relative_web_url(text: &str) -> Option<String> {
+    for (start, _) in text.match_indices("//") {
+        if start > 0 && text.as_bytes().get(start - 1) == Some(&b':') {
+            continue;
+        }
+
+        let url = trim_embedded_url(&text[start..]);
+        if url.len() > 2 && url[2..].contains('.') {
+            return Some(format!("https:{url}"));
+        }
+    }
+
+    None
+}
+
+fn trim_embedded_url(text: &str) -> &str {
+    let end = text
+        .find(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '"' | '\'' | '<' | '>' | '[' | ']' | '\\')
+        })
+        .unwrap_or(text.len());
+    text[..end].trim_end_matches([',', ';', ')', '}'])
+}
+
 #[derive(Clone)]
 pub struct AndroidNavigatorInterface;
 
@@ -63,7 +99,12 @@ impl<F: FutureSpawner<Error> + 'static> NavigatorBackend for AndroidNavigatorBac
         }
 
         if parsed_url.scheme() == "javascript" {
-            log::info!("Ignoring javascript navigation request: {parsed_url}");
+            if let Some(web_url) = find_web_url_in_text(parsed_url.as_ref()) {
+                log::info!("Opening web URL from javascript navigation: {web_url}");
+                crate::open_web_login_url(&web_url);
+            } else {
+                log::info!("Ignoring javascript navigation request: {parsed_url}");
+            }
             return;
         }
 

@@ -796,7 +796,7 @@ class PlayerActivity : GameActivity() {
         return url
     }
 
-    private fun recentCustomMovieUrls(): List<String> =
+    private fun storedCustomMovieUrls(): List<String> =
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(KEY_CUSTOM_MOVIE_URLS, null)
             ?.split('\n')
@@ -805,8 +805,13 @@ class PlayerActivity : GameActivity() {
             ?.take(MAX_CUSTOM_MOVIE_URLS)
             ?: emptyList()
 
+    private fun recentCustomMovieUrls(): List<String> =
+        (storedCustomMovieUrls() + DEFAULT_CUSTOM_MOVIE_URLS)
+            .distinct()
+            .take(MAX_CUSTOM_MOVIE_URLS)
+
     private fun rememberCustomMovieUrl(url: String) {
-        val urls = (listOf(url) + recentCustomMovieUrls().filter { it != url })
+        val urls = (listOf(url) + storedCustomMovieUrls().filter { it != url })
             .take(MAX_CUSTOM_MOVIE_URLS)
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
@@ -1631,6 +1636,10 @@ class PlayerActivity : GameActivity() {
         private const val MAX_IME_DELETE_REPEAT = 8
         private const val MAX_IME_SHADOW_CHARS = 64
         private const val MAX_CUSTOM_MOVIE_URLS = 3
+        private val DEFAULT_CUSTOM_MOVIE_URLS = listOf(
+            "http://seer2.61.com/Client.swf",
+            "https://seer.61.com/Client.swf"
+        )
         private var crashLoggerInstalled = false
 
         init {
