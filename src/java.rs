@@ -228,6 +228,41 @@ impl JavaInterface {
         result.expect("setNoMovieBackgroundVisible() must never throw");
     }
 
+    pub fn open_web_login(env: &mut JNIEnv, this: &JObject, url: &str) {
+        let java_url = env.new_string(url).unwrap();
+        let result = env.call_method(
+            this,
+            "openWebLogin",
+            "(Ljava/lang/String;)V",
+            &[(&java_url).into()],
+        );
+        result.expect("openWebLogin() must never throw");
+    }
+
+    pub fn handle_external_interface_call(
+        env: &mut JNIEnv,
+        this: &JObject,
+        name: &str,
+        args: &str,
+        url: Option<&str>,
+    ) {
+        let java_name = env.new_string(name).unwrap();
+        let java_args = env.new_string(args).unwrap();
+        let java_url = url.map(|url| env.new_string(url).unwrap());
+        let null_url = JObject::null();
+        let url_value = match java_url.as_ref() {
+            Some(url) => JValue::Object(url),
+            None => JValue::Object(&null_url),
+        };
+        let result = env.call_method(
+            this,
+            "handleExternalInterfaceCall",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[(&java_name).into(), (&java_args).into(), url_value],
+        );
+        result.expect("handleExternalInterfaceCall() must never throw");
+    }
+
     pub fn show_virtual_keyboard(env: &mut JNIEnv, this: &JObject) {
         let result = unsafe {
             env.call_method_unchecked(
