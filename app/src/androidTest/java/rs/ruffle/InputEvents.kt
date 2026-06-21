@@ -1,12 +1,12 @@
 package rs.ruffle
 
-import android.content.Context
+import android.content.ComponentName
+import android.content.Intent
 import android.graphics.Point
 import android.graphics.Rect
 import android.net.Uri
 import android.os.SystemClock
 import android.view.KeyEvent
-import androidx.test.core.app.ApplicationProvider
 import androidx.test.espresso.matcher.ViewMatchers
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -52,7 +52,7 @@ class InputEvents {
         )
 
         // Launch the app
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
         traceOutput = File.createTempFile("trace", ".txt", context.cacheDir)
         swfFile = File.createTempFile("movie", ".swf", context.cacheDir)
         lastTraceSize = 0
@@ -76,25 +76,14 @@ class InputEvents {
     }
 
     private fun startPlayerActivity(swfFile: File, traceOutput: File) {
-        val swfUri = Uri.fromFile(swfFile)
-        device.executeShellCommand(
-            listOf(
-                "am",
-                "start",
-                "-W",
-                "-a",
-                "android.intent.action.VIEW",
-                "-d",
-                swfUri.toString(),
-                "-n",
-                "$BASIC_SAMPLE_PACKAGE/rs.ruffle.PlayerActivity",
-                "--es",
-                "traceOutput",
-                traceOutput.absolutePath,
-                "-f",
-                "268468224"
-            ).joinToString(" ")
-        )
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            component = ComponentName(BASIC_SAMPLE_PACKAGE, "rs.ruffle.PlayerActivity")
+            data = Uri.fromFile(swfFile)
+            putExtra("traceOutput", traceOutput.absolutePath)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        context.startActivity(intent)
     }
 
     @Test
