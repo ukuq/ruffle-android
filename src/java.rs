@@ -207,6 +207,27 @@ impl JavaInterface {
         result.expect("showLoadFailureAndExit() must never throw");
     }
 
+    pub fn show_load_error(env: &mut JNIEnv, this: &JObject, message: &str) {
+        let java_message = env.new_string(message).unwrap();
+        let result = env.call_method(
+            this,
+            "showLoadFailure",
+            "(Ljava/lang/String;)V",
+            &[(&java_message).into()],
+        );
+        result.expect("showLoadFailure() must never throw");
+    }
+
+    pub fn set_no_movie_background_visible(env: &mut JNIEnv, this: &JObject, visible: bool) {
+        let result = env.call_method(
+            this,
+            "setNoMovieBackgroundVisible",
+            "(Z)V",
+            &[JValue::Bool(if visible { 1 } else { 0 })],
+        );
+        result.expect("setNoMovieBackgroundVisible() must never throw");
+    }
+
     pub fn show_virtual_keyboard(env: &mut JNIEnv, this: &JObject) {
         let result = unsafe {
             env.call_method_unchecked(

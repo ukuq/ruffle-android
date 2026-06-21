@@ -23,4 +23,5 @@ pub enum RuffleEvent {
     ClearContextMenu,
     RequestContextMenu,
     ReloadMovie,
+    SetHoverClickMode(bool),
 }

@@ -64,11 +64,19 @@ impl UiBackend for AndroidUiBackend {
         Ok(())
     }
 
-    fn display_root_movie_download_failed_message(
-        &self,
-        _invalid_swf: bool,
-        _fetched_error: String,
-    ) {
+    fn display_root_movie_download_failed_message(&self, invalid_swf: bool, fetched_error: String) {
+        let reason = if invalid_swf {
+            "\u{4e0d}\u{662f}\u{6709}\u{6548}\u{7684} SWF \u{6587}\u{4ef6}"
+        } else if fetched_error.to_lowercase().contains("domain") {
+            "\u{57df}\u{540d}\u{89e3}\u{6790}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{624b}\u{673a}\u{7f51}\u{7edc}/DNS \u{6216}\u{66f4}\u{6362}\u{53ef}\u{8bbf}\u{95ee}\u{7684}\u{94fe}\u{63a5}"
+        } else {
+            "\u{4e0b}\u{8f7d}\u{5931}\u{8d25}"
+        };
+        let message =
+            format!("\u{52a0}\u{8f7d} SWF \u{5931}\u{8d25}\u{ff1a}{reason}\n{fetched_error}");
+        with_android_activity(|env, activity| {
+            JavaInterface::show_load_error(env, activity, &message);
+        });
     }
 
     fn message(&self, _message: &str) {}
