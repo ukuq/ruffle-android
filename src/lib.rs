@@ -41,11 +41,10 @@ use url::Url;
 
 use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
-    backend::navigator::{FetchReason, OwnedFuture, Request},
+    backend::navigator::OwnedFuture,
     events::{LogicalKey, MouseButton, PlayerEvent, TextControlCode},
     external::{ExternalInterfaceProvider, Value as ExternalValue},
     font::DefaultFont,
-    tag_utils::SwfMovie,
     Player, PlayerBuilder, StageAlign, StageScaleMode, ViewportDimensions,
 };
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
@@ -489,71 +488,6 @@ fn create_render_backend(
     }
 
     Err(last_error)
-}
-
-fn load_replacement_root_movie<'gc>(
-    uc: &ruffle_core::context::UpdateContext<'gc>,
-    movie_url: String,
-) -> OwnedFuture<(), ruffle_core::loader::Error> {
-    let player = uc.player_handle();
-
-    Box::pin(async move {
-        let fetch = match player.lock() {
-            Ok(player) => player.fetch(Request::get(movie_url), FetchReason::LoadSwf),
-            Err(error) => {
-                log::warn!("Skipping Flash reload; player lock is poisoned: {error}");
-                return Ok(());
-            }
-        };
-        let response = fetch.await.map_err(|error| {
-            if let Ok(player) = player.lock() {
-                player
-                    .ui()
-                    .display_root_movie_download_failed_message(false, error.error.to_string());
-            }
-            error.error
-        })?;
-        let swf_url = response.url().into_owned();
-        let body = response.body().await.inspect_err(|error| {
-            if let Ok(player) = player.lock() {
-                player
-                    .ui()
-                    .display_root_movie_download_failed_message(true, error.to_string());
-            }
-        })?;
-
-        let spoofed_or_swf_url = match player.lock() {
-            Ok(player) => player
-                .spoofed_url()
-                .map(|url| url.to_string())
-                .unwrap_or(swf_url),
-            Err(error) => {
-                log::warn!("Using fetched URL during reload; player lock is poisoned: {error}");
-                swf_url
-            }
-        };
-
-        let movie = SwfMovie::from_data(&body, spoofed_or_swf_url, None).map_err(|error| {
-            if let Ok(player) = player.lock() {
-                player
-                    .ui()
-                    .display_root_movie_download_failed_message(true, error.to_string());
-            }
-            ruffle_core::loader::Error::InvalidSwf(error)
-        })?;
-
-        let Ok(mut player_lock) = player.lock() else {
-            log::warn!("Skipping Flash reload apply; player lock is poisoned");
-            return Ok(());
-        };
-        player_lock.set_is_playing(false);
-        player_lock.mutate_with_update_context(|uc| {
-            uc.replace_root_movie(movie);
-        });
-        player_lock.set_is_playing(true);
-        set_no_movie_background_visible(false);
-        Ok(())
-    })
 }
 
 fn recreate_player_surface(
@@ -1175,24 +1109,6 @@ async fn run(app: AndroidApp) {
                         }
                     }
                 }
-                RuffleEvent::ReloadMovie => {
-                    if let (Some(player), Some(movie_url)) =
-                        (playerbox.as_ref(), root_movie_url.as_ref())
-                    {
-                        log::info!("Replacing root Flash movie");
-                        if let Ok(mut player) = player.player.lock() {
-                            player.mutate_with_update_context(|uc| {
-                                let future = load_replacement_root_movie(uc, movie_url.to_owned());
-                                uc.navigator.spawn_future(future);
-                            });
-                            needs_redraw = true;
-                        } else {
-                            log::warn!("Ignoring Flash reload request; player lock is poisoned");
-                        }
-                    } else {
-                        log::warn!("Ignoring Flash reload request before player is ready");
-                    }
-                }
                 RuffleEvent::ExternalInterfaceCallback { name, payload } => {
                     if let Some(player) = playerbox.as_ref() {
                         match player.player.lock() {
@@ -1458,18 +1374,6 @@ fn handle_external_interface_call(name: &str, args: &str, url: Option<&str>) {
     }
 }
 
-fn set_no_movie_background_visible(visible: bool) {
-    match get_jvm() {
-        Ok((jvm, activity)) => match jvm.attach_current_thread() {
-            Ok(mut env) => {
-                JavaInterface::set_no_movie_background_visible(&mut env, &activity, visible)
-            }
-            Err(err) => log::error!("Failed to attach JVM for no-movie background: {}", err),
-        },
-        Err(err) => log::error!("Failed to get JVM for no-movie background: {}", err),
-    }
-}
-
 fn start_server_metrics_overlay(metrics: Arc<seer2::CacheMetrics>) {
     thread::spawn(move || {
         let mut last = String::new();
@@ -1625,17 +1529,6 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_clearContextMenu(
     match event_loop {
         Ok(event_loop) => event_loop.send(RuffleEvent::ClearContextMenu),
         Err(error) => log::warn!("Ignoring context menu clear before event loop: {error:?}"),
-    }
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_reloadGame(mut env: JNIEnv, this: JObject) {
-    let event_loop: Result<MutexGuard<EventSender>, _> =
-        env.get_rust_field(this, "eventLoopHandle");
-    match event_loop {
-        Ok(event_loop) => event_loop.send(RuffleEvent::ReloadMovie),
-        Err(error) => log::warn!("Ignoring reload request before event loop is ready: {error:?}"),
     }
 }
 

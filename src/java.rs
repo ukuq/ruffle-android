@@ -218,16 +218,6 @@ impl JavaInterface {
         result.expect("showLoadFailure() must never throw");
     }
 
-    pub fn set_no_movie_background_visible(env: &mut JNIEnv, this: &JObject, visible: bool) {
-        let result = env.call_method(
-            this,
-            "setNoMovieBackgroundVisible",
-            "(Z)V",
-            &[JValue::Bool(if visible { 1 } else { 0 })],
-        );
-        result.expect("setNoMovieBackgroundVisible() must never throw");
-    }
-
     pub fn open_web_login(env: &mut JNIEnv, this: &JObject, url: &str) {
         let java_url = env.new_string(url).unwrap();
         let result = env.call_method(
