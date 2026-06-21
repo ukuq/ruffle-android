@@ -11,7 +11,7 @@ use custom_event::RuffleEvent;
 
 use jni::{
     objects::{JObject, JString},
-    sys::{self, jint, jobject},
+    sys::{self, jboolean, jint, jobject},
     JNIEnv, JavaVM,
 };
 use keycodes::{android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor};
@@ -237,20 +237,22 @@ fn create_active_player(
         player_id,
     };
 
-    let navigator = AndroidNavigatorBackend::new(ExternalNavigatorBackend::new(
-        movie_url_parsed.clone(),
-        None,
-        None,
-        future_spawner,
-        None,
-        false,
-        Default::default(),
-        ruffle_core::backend::navigator::SocketMode::Allow,
-        Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
-            movie_url_parsed,
-        ))),
-        AndroidNavigatorInterface,
-    ));
+    let navigator =
+        AndroidNavigatorBackend::new(ExternalNavigatorBackend::new_with_environment_proxies(
+            movie_url_parsed.clone(),
+            None,
+            None,
+            future_spawner,
+            None,
+            false,
+            false,
+            Default::default(),
+            ruffle_core::backend::navigator::SocketMode::Allow,
+            Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
+                movie_url_parsed,
+            ))),
+            AndroidNavigatorInterface,
+        ));
 
     let active_player = ActivePlayer {
         id: player_id,
@@ -400,6 +402,7 @@ fn load_replacement_root_movie<'gc>(
             uc.replace_root_movie(movie);
         });
         player_lock.set_is_playing(true);
+        set_no_movie_background_visible(false);
         Ok(())
     })
 }
@@ -527,6 +530,7 @@ async fn run(app: AndroidApp) {
     let render_backend;
     let render_scale;
     let mut stage_quality;
+    let mut hover_click_mode = false;
 
     unsafe {
         let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut sys::JavaVM).expect("JVM must exist");
@@ -750,6 +754,13 @@ async fn run(app: AndroidApp) {
                                     let ruffle_event = match event.action() {
                                         MotionAction::Down
                                         | MotionAction::PointerDown
+                                        | MotionAction::ButtonPress
+                                            if hover_click_mode =>
+                                        {
+                                            PlayerEvent::MouseMove { x, y }
+                                        }
+                                        MotionAction::Down
+                                        | MotionAction::PointerDown
                                         | MotionAction::ButtonPress => {
                                             PlayerEvent::MouseDown {
                                                 x,
@@ -757,6 +768,13 @@ async fn run(app: AndroidApp) {
                                                 button: MouseButton::Left, // TODO
                                                 index: None,               // TODO
                                             }
+                                        }
+                                        MotionAction::Up
+                                        | MotionAction::PointerUp
+                                        | MotionAction::ButtonRelease
+                                            if hover_click_mode =>
+                                        {
+                                            PlayerEvent::MouseMove { x, y }
                                         }
                                         MotionAction::Up
                                         | MotionAction::PointerUp
@@ -984,6 +1002,10 @@ async fn run(app: AndroidApp) {
                         log::warn!("Ignoring Flash reload request before player is ready");
                     }
                 }
+                RuffleEvent::SetHoverClickMode(enabled) => {
+                    hover_click_mode = enabled;
+                    log::info!("Hover click mode: {enabled}");
+                }
             }
         }
 
@@ -1199,6 +1221,18 @@ fn show_load_failure(message: &str) {
     }
 }
 
+fn set_no_movie_background_visible(visible: bool) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => {
+                JavaInterface::set_no_movie_background_visible(&mut env, &activity, visible)
+            }
+            Err(err) => log::error!("Failed to attach JVM for no-movie background: {}", err),
+        },
+        Err(err) => log::error!("Failed to get JVM for no-movie background: {}", err),
+    }
+}
+
 fn start_server_metrics_overlay(metrics: Arc<seer2::CacheMetrics>) {
     thread::spawn(move || {
         let mut last = String::new();
@@ -1365,6 +1399,23 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_reloadGame(mut env: JNIEn
     match event_loop {
         Ok(event_loop) => event_loop.send(RuffleEvent::ReloadMovie),
         Err(error) => log::warn!("Ignoring reload request before event loop is ready: {error:?}"),
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setHoverClickMode(
+    mut env: JNIEnv,
+    this: JObject,
+    enabled: jboolean,
+) {
+    let event_loop: Result<MutexGuard<EventSender>, _> =
+        env.get_rust_field(this, "eventLoopHandle");
+    match event_loop {
+        Ok(event_loop) => event_loop.send(RuffleEvent::SetHoverClickMode(enabled != 0)),
+        Err(error) => {
+            log::warn!("Ignoring hover click mode change before event loop is ready: {error:?}");
+        }
     }
 }
 

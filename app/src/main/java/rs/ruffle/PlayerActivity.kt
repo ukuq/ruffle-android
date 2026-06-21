@@ -9,12 +9,14 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
 import android.os.Build.VERSION_CODES
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.TextUtils
 import android.util.Log
 import android.util.TypedValue
 import android.view.KeyEvent
@@ -32,6 +34,7 @@ import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.TextView
@@ -116,6 +119,7 @@ class PlayerActivity : GameActivity() {
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
     private external fun reloadGame()
+    private external fun setHoverClickMode(enabled: Boolean)
 
     private lateinit var ruffleInputView: RuffleInputView
     private lateinit var diagnosticOverlay: LinearLayout
@@ -125,8 +129,11 @@ class PlayerActivity : GameActivity() {
     private lateinit var renderBackendButton: TextView
     private lateinit var renderScaleButton: TextView
     private lateinit var stageQualityButton: TextView
+    private lateinit var hoverClickButton: TextView
+    private lateinit var noMovieBackgroundView: View
     private var imeWasVisible = false
     private var consumeImeDismissTouch = false
+    private var hoverClickModeEnabled = false
     private val audioManager: AudioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
@@ -256,6 +263,32 @@ class PlayerActivity : GameActivity() {
         }
     }
 
+    @Suppress("unused")
+    // Used by Rust
+    private fun showLoadFailure(message: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) {
+                return@runOnUiThread
+            }
+            AlertDialog.Builder(this)
+                .setTitle("\u52a0\u8f7d\u5931\u8d25")
+                .setMessage(message)
+                .setPositiveButton("\u786e\u5b9a", null)
+                .show()
+        }
+    }
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun setNoMovieBackgroundVisible(visible: Boolean) {
+        runOnUiThread {
+            if (!::noMovieBackgroundView.isInitialized) {
+                return@runOnUiThread
+            }
+            noMovieBackgroundView.visibility = if (visible) View.VISIBLE else View.GONE
+        }
+    }
+
     override fun onCreateSurfaceView() {
         val inflater = layoutInflater
 
@@ -303,6 +336,25 @@ class PlayerActivity : GameActivity() {
                 bottomToBottom = ConstraintLayout.LayoutParams.PARENT_ID
             }
         )
+        noMovieBackgroundView = View(this).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        layout.addView(
+            noMovieBackgroundView,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.MATCH_PARENT,
+                ConstraintLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+                endToEnd = ConstraintLayout.LayoutParams.PARENT_ID
+                topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+                bottomToBottom = ConstraintLayout.LayoutParams.PARENT_ID
+            }
+        )
         diagnosticOverlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             isClickable = false
@@ -338,6 +390,32 @@ class PlayerActivity : GameActivity() {
                 bottomMargin = dp(8)
             }
         )
+        val customMovieButton = TextView(this).apply {
+            id = View.generateViewId()
+            text = "\u64ad\u653e\u81ea\u5b9a\u4e49"
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            typeface = Typeface.DEFAULT_BOLD
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            includeFontPadding = false
+            setPadding(dp(8), dp(5), dp(8), dp(5))
+            isClickable = true
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setOnClickListener { showCustomMovieDialog() }
+        }
+        layout.addView(
+            customMovieButton,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.WRAP_CONTENT,
+                ConstraintLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+                topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+                marginStart = dp(8)
+                topMargin = dp(8)
+            }
+        )
         renderBackendButton = TextView(this).apply {
             id = View.generateViewId()
             text = renderBackendButtonText(currentRenderBackend())
@@ -359,9 +437,9 @@ class PlayerActivity : GameActivity() {
                 ConstraintLayout.LayoutParams.WRAP_CONTENT
             ).apply {
                 startToStart = ConstraintLayout.LayoutParams.PARENT_ID
-                topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+                topToBottom = customMovieButton.id
                 marginStart = dp(8)
-                topMargin = dp(8)
+                topMargin = dp(6)
             }
         )
         renderScaleButton = TextView(this).apply {
@@ -391,6 +469,7 @@ class PlayerActivity : GameActivity() {
             }
         )
         stageQualityButton = TextView(this).apply {
+            id = View.generateViewId()
             text = stageQualityButtonText(currentStageQuality())
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.TRANSPARENT)
@@ -416,6 +495,7 @@ class PlayerActivity : GameActivity() {
             }
         )
         addTopActionButtons(layout)
+        addHoverClickButton(layout)
         addHealthNotice(layout)
         val keys = gatherAllDescendantsOfType<Button>(
             layout.getViewById(R.id.keyboard),
@@ -472,6 +552,127 @@ class PlayerActivity : GameActivity() {
 
     private fun stageQualityButtonText(quality: StageQuality): String =
         "\u753b\u8d28:${quality.label}"
+
+    private fun showCustomMovieDialog() {
+        val recentUrls = recentCustomMovieUrls()
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+            hint = "https://example.com/movie.swf"
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isFocusableInTouchMode = true
+            setPadding(dp(2), 0, dp(2), 0)
+            addView(
+                input,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+        if (recentUrls.isNotEmpty()) {
+            content.addView(
+                TextView(this).apply {
+                    text = "\u6700\u8fd1\u4f7f\u7528"
+                    setTextColor(Color.DKGRAY)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    includeFontPadding = false
+                    setPadding(0, dp(10), 0, dp(2))
+                }
+            )
+            recentUrls.forEach { recentUrl ->
+                content.addView(
+                    TextView(this).apply {
+                        text = recentUrl
+                        setTextColor(Color.rgb(40, 80, 160))
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                        includeFontPadding = false
+                        setSingleLine(true)
+                        ellipsize = TextUtils.TruncateAt.MIDDLE
+                        setPadding(0, dp(6), 0, dp(6))
+                        isClickable = true
+                        isFocusable = false
+                        setOnClickListener {
+                            input.setText(recentUrl)
+                            input.setSelection(input.text.length)
+                        }
+                    }
+                )
+            }
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("\u64ad\u653e\u81ea\u5b9a\u4e49")
+            .setView(content)
+            .setPositiveButton("\u6253\u5f00", null)
+            .setNegativeButton("\u53d6\u6d88", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val url = normalizedCustomMovieUrl(input.text?.toString())
+                if (url == null) {
+                    input.error =
+                        "\u8bf7\u8f93\u5165 http:// \u6216 https:// \u5f00\u5934\u7684 SWF URL"
+                    return@setOnClickListener
+                }
+                rememberCustomMovieUrl(url)
+                setNoMovieBackgroundVisible(true)
+                restartWithMovieUrl(url)
+                dialog.dismiss()
+            }
+            content.requestFocus()
+            dialog.window?.setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+            )
+        }
+        dialog.show()
+    }
+
+    private fun restartWithMovieUrl(url: String) {
+        Log.i("ruffle", "Restarting with custom Flash movie: $url")
+        startActivity(
+            Intent(this, RestartActivity::class.java).apply {
+                putExtra(RestartActivity.EXTRA_SWF_URI, url)
+                addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            }
+        )
+        finish()
+    }
+
+    private fun normalizedCustomMovieUrl(value: String?): String? {
+        var url = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        if (!url.contains("://")) {
+            url = "https://$url"
+        }
+        val parsed = Uri.parse(url)
+        val scheme = parsed.scheme?.lowercase(Locale.US) ?: return null
+        if (scheme != "http" && scheme != "https") {
+            return null
+        }
+        if (parsed.host.isNullOrBlank()) {
+            return null
+        }
+        return url
+    }
+
+    private fun recentCustomMovieUrls(): List<String> =
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_CUSTOM_MOVIE_URLS, null)
+            ?.split('\n')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.take(MAX_CUSTOM_MOVIE_URLS)
+            ?: emptyList()
+
+    private fun rememberCustomMovieUrl(url: String) {
+        val urls = (listOf(url) + recentCustomMovieUrls().filter { it != url })
+            .take(MAX_CUSTOM_MOVIE_URLS)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CUSTOM_MOVIE_URLS, urls.joinToString("\n"))
+            .apply()
+    }
 
     private fun showRenderBackendMenu() {
         val current = currentRenderBackend()
@@ -777,6 +978,51 @@ class PlayerActivity : GameActivity() {
                 topMargin = dp(8)
             }
         )
+    }
+
+    private fun addHoverClickButton(layout: ConstraintLayout) {
+        hoverClickButton = TextView(this).apply {
+            id = View.generateViewId()
+            text = "\u7981\u7528\u70b9\u51fb"
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            includeFontPadding = false
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            isClickable = true
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setOnClickListener {
+                hoverClickModeEnabled = !hoverClickModeEnabled
+                setHoverClickMode(hoverClickModeEnabled)
+                updateHoverClickButton()
+            }
+        }
+        updateHoverClickButton()
+        layout.addView(
+            hoverClickButton,
+            ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.WRAP_CONTENT,
+                ConstraintLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+                topToBottom = stageQualityButton.id
+                marginStart = dp(8)
+                topMargin = dp(34)
+            }
+        )
+    }
+
+    private fun updateHoverClickButton() {
+        if (!::hoverClickButton.isInitialized) {
+            return
+        }
+        val background = if (hoverClickModeEnabled) {
+            0x55FF6B6B
+        } else {
+            Color.TRANSPARENT
+        }
+        hoverClickButton.setBackgroundColor(background)
     }
 
     private fun addHealthNotice(layout: ConstraintLayout) {
@@ -1146,12 +1392,14 @@ class PlayerActivity : GameActivity() {
         private const val KEY_RENDER_BACKEND = "render_backend"
         private const val KEY_RENDER_SCALE = "render_scale"
         private const val KEY_STAGE_QUALITY = "stage_quality"
+        private const val KEY_CUSTOM_MOVIE_URLS = "custom_movie_urls"
         private const val CRASH_PREFS_NAME = "crash_logs"
         private const val KEY_PENDING_CRASH = "pending_native_panic"
         private const val HEALTH_NOTICE_MS = 1000L
         private const val IME_DELETE_SENTINEL = "\u200b"
         private const val MAX_IME_DELETE_REPEAT = 8
         private const val MAX_IME_SHADOW_CHARS = 64
+        private const val MAX_CUSTOM_MOVIE_URLS = 3
         private var crashLoggerInstalled = false
 
         init {

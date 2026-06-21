@@ -51,6 +51,7 @@ impl<F: FutureSpawner<Error> + 'static> NavigatorBackend for AndroidNavigatorBac
     }
 
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        log::info!("Fetching {}", request.url());
         self.inner.fetch(request)
     }
 
@@ -75,6 +76,7 @@ impl<F: FutureSpawner<Error> + 'static> NavigatorBackend for AndroidNavigatorBac
         receiver: Receiver<Vec<u8>>,
         sender: Sender<SocketAction>,
     ) {
+        log::info!("Connecting socket {host}:{port}");
         let timeout = if timeout.is_zero() {
             Duration::from_secs(20)
         } else {
