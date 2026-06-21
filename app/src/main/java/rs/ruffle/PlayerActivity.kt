@@ -88,7 +88,7 @@ class PlayerActivity : GameActivity() {
     // Used by Rust
     private val swfUri: String?
         get() {
-            return intent.dataString
+            return intent.getStringExtra(EXTRA_SWF_URI) ?: intent.dataString
         }
 
     private var loc = IntArray(2)
@@ -1436,6 +1436,11 @@ class PlayerActivity : GameActivity() {
         KeepAliveService.start(this)
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+    }
+
     override fun onResume() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -1504,58 +1509,57 @@ class PlayerActivity : GameActivity() {
         return true
     }
 
-    private fun hardwareKeyTag(keyCode: Int): String? =
-        when (keyCode) {
-            KeyEvent.KEYCODE_A -> "A"
-            KeyEvent.KEYCODE_B -> "B"
-            KeyEvent.KEYCODE_C -> "C"
-            KeyEvent.KEYCODE_D -> "D"
-            KeyEvent.KEYCODE_E -> "E"
-            KeyEvent.KEYCODE_F -> "F"
-            KeyEvent.KEYCODE_G -> "G"
-            KeyEvent.KEYCODE_H -> "H"
-            KeyEvent.KEYCODE_I -> "I"
-            KeyEvent.KEYCODE_J -> "J"
-            KeyEvent.KEYCODE_K -> "K"
-            KeyEvent.KEYCODE_L -> "L"
-            KeyEvent.KEYCODE_M -> "M"
-            KeyEvent.KEYCODE_N -> "N"
-            KeyEvent.KEYCODE_O -> "O"
-            KeyEvent.KEYCODE_P -> "P"
-            KeyEvent.KEYCODE_Q -> "Q"
-            KeyEvent.KEYCODE_R -> "R"
-            KeyEvent.KEYCODE_S -> "S"
-            KeyEvent.KEYCODE_T -> "T"
-            KeyEvent.KEYCODE_U -> "U"
-            KeyEvent.KEYCODE_V -> "V"
-            KeyEvent.KEYCODE_W -> "W"
-            KeyEvent.KEYCODE_X -> "X"
-            KeyEvent.KEYCODE_Y -> "Y"
-            KeyEvent.KEYCODE_Z -> "Z"
-            KeyEvent.KEYCODE_0 -> "0"
-            KeyEvent.KEYCODE_1 -> "1"
-            KeyEvent.KEYCODE_2 -> "2"
-            KeyEvent.KEYCODE_3 -> "3"
-            KeyEvent.KEYCODE_4 -> "4"
-            KeyEvent.KEYCODE_5 -> "5"
-            KeyEvent.KEYCODE_6 -> "6"
-            KeyEvent.KEYCODE_7 -> "7"
-            KeyEvent.KEYCODE_8 -> "8"
-            KeyEvent.KEYCODE_9 -> "9"
-            KeyEvent.KEYCODE_DPAD_UP -> "UP"
-            KeyEvent.KEYCODE_DPAD_DOWN -> "DOWN"
-            KeyEvent.KEYCODE_DPAD_LEFT -> "LEFT"
-            KeyEvent.KEYCODE_DPAD_RIGHT -> "RIGHT"
-            KeyEvent.KEYCODE_SPACE -> "SPACE"
-            KeyEvent.KEYCODE_DEL -> "BACKSPACE"
-            KeyEvent.KEYCODE_ENTER -> "ENTER"
-            KeyEvent.KEYCODE_NUMPAD_ENTER -> "ENTER"
-            KeyEvent.KEYCODE_ALT_LEFT -> "ALT"
-            KeyEvent.KEYCODE_ALT_RIGHT -> "ALT"
-            KeyEvent.KEYCODE_CTRL_LEFT -> "CTRL"
-            KeyEvent.KEYCODE_CTRL_RIGHT -> "CTRL"
-            else -> null
-        }
+    private fun hardwareKeyTag(keyCode: Int): String? = when (keyCode) {
+        KeyEvent.KEYCODE_A -> "A"
+        KeyEvent.KEYCODE_B -> "B"
+        KeyEvent.KEYCODE_C -> "C"
+        KeyEvent.KEYCODE_D -> "D"
+        KeyEvent.KEYCODE_E -> "E"
+        KeyEvent.KEYCODE_F -> "F"
+        KeyEvent.KEYCODE_G -> "G"
+        KeyEvent.KEYCODE_H -> "H"
+        KeyEvent.KEYCODE_I -> "I"
+        KeyEvent.KEYCODE_J -> "J"
+        KeyEvent.KEYCODE_K -> "K"
+        KeyEvent.KEYCODE_L -> "L"
+        KeyEvent.KEYCODE_M -> "M"
+        KeyEvent.KEYCODE_N -> "N"
+        KeyEvent.KEYCODE_O -> "O"
+        KeyEvent.KEYCODE_P -> "P"
+        KeyEvent.KEYCODE_Q -> "Q"
+        KeyEvent.KEYCODE_R -> "R"
+        KeyEvent.KEYCODE_S -> "S"
+        KeyEvent.KEYCODE_T -> "T"
+        KeyEvent.KEYCODE_U -> "U"
+        KeyEvent.KEYCODE_V -> "V"
+        KeyEvent.KEYCODE_W -> "W"
+        KeyEvent.KEYCODE_X -> "X"
+        KeyEvent.KEYCODE_Y -> "Y"
+        KeyEvent.KEYCODE_Z -> "Z"
+        KeyEvent.KEYCODE_0 -> "0"
+        KeyEvent.KEYCODE_1 -> "1"
+        KeyEvent.KEYCODE_2 -> "2"
+        KeyEvent.KEYCODE_3 -> "3"
+        KeyEvent.KEYCODE_4 -> "4"
+        KeyEvent.KEYCODE_5 -> "5"
+        KeyEvent.KEYCODE_6 -> "6"
+        KeyEvent.KEYCODE_7 -> "7"
+        KeyEvent.KEYCODE_8 -> "8"
+        KeyEvent.KEYCODE_9 -> "9"
+        KeyEvent.KEYCODE_DPAD_UP -> "UP"
+        KeyEvent.KEYCODE_DPAD_DOWN -> "DOWN"
+        KeyEvent.KEYCODE_DPAD_LEFT -> "LEFT"
+        KeyEvent.KEYCODE_DPAD_RIGHT -> "RIGHT"
+        KeyEvent.KEYCODE_SPACE -> "SPACE"
+        KeyEvent.KEYCODE_DEL -> "BACKSPACE"
+        KeyEvent.KEYCODE_ENTER -> "ENTER"
+        KeyEvent.KEYCODE_NUMPAD_ENTER -> "ENTER"
+        KeyEvent.KEYCODE_ALT_LEFT -> "ALT"
+        KeyEvent.KEYCODE_ALT_RIGHT -> "ALT"
+        KeyEvent.KEYCODE_CTRL_LEFT -> "CTRL"
+        KeyEvent.KEYCODE_CTRL_RIGHT -> "CTRL"
+        else -> null
+    }
 
     private fun installCrashLogger() {
         if (crashLoggerInstalled) {
@@ -1619,6 +1623,7 @@ class PlayerActivity : GameActivity() {
         private const val KEY_RENDER_SCALE = "render_scale"
         private const val KEY_STAGE_QUALITY = "stage_quality"
         private const val KEY_CUSTOM_MOVIE_URLS = "custom_movie_urls"
+        private const val EXTRA_SWF_URI = "swfUri"
         private const val CRASH_PREFS_NAME = "crash_logs"
         private const val KEY_PENDING_CRASH = "pending_native_panic"
         private const val HEALTH_NOTICE_MS = 1000L
