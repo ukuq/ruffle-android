@@ -1,6 +1,7 @@
 package rs.ruffle
 
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.graphics.Point
 import android.graphics.Rect
@@ -27,6 +28,10 @@ private const val LAUNCH_TIMEOUT = 60000L
 private const val TRACE_TIMEOUT = 30000L
 private const val SWF_WIDTH = 550.0
 private const val SWF_HEIGHT = 400.0
+private const val PREFS_NAME = "ruffle_settings"
+private const val KEY_RENDER_BACKEND = "render_backend"
+private const val TEST_RENDER_BACKEND = "opengl"
+private const val EXTRA_SWF_URI = "swfUri"
 
 @RunWith(AndroidJUnit4::class)
 class InputEvents {
@@ -53,6 +58,10 @@ class InputEvents {
 
         // Launch the app
         val context = InstrumentationRegistry.getInstrumentation().targetContext
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_RENDER_BACKEND, TEST_RENDER_BACKEND)
+            .commit()
         traceOutput = File.createTempFile("trace", ".txt", context.cacheDir)
         swfFile = File.createTempFile("movie", ".swf", context.cacheDir)
         lastTraceSize = 0
@@ -77,9 +86,11 @@ class InputEvents {
 
     private fun startPlayerActivity(swfFile: File, traceOutput: File) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val swfUri = Uri.fromFile(swfFile)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             component = ComponentName(BASIC_SAMPLE_PACKAGE, "rs.ruffle.PlayerActivity")
-            data = Uri.fromFile(swfFile)
+            data = swfUri
+            putExtra(EXTRA_SWF_URI, swfUri.toString())
             putExtra("traceOutput", traceOutput.absolutePath)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
