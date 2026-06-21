@@ -123,7 +123,6 @@ class PlayerActivity : GameActivity() {
     private external fun requestContextMenu()
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
-    private external fun reloadGame()
     private external fun externalInterfaceCallback(name: String, payload: String)
     private external fun setHoverClickMode(enabled: Boolean)
 
@@ -934,7 +933,7 @@ class PlayerActivity : GameActivity() {
         AlertDialog.Builder(this)
             .setTitle("刷新游戏")
             .setMessage("确定要重新加载当前 Flash 吗？")
-            .setPositiveButton("刷新") { _, _ -> reloadGame() }
+            .setPositiveButton("刷新") { _, _ -> restartApplication() }
             .setNegativeButton("取消", null)
             .show()
     }
@@ -948,8 +947,12 @@ class PlayerActivity : GameActivity() {
 
     private fun restartApplication() {
         KeepAliveService.stop(this)
+        val currentSwfUri = swfUri?.takeIf { it.isNotBlank() }
         startActivity(
             Intent(this, RestartActivity::class.java).apply {
+                if (currentSwfUri != null) {
+                    putExtra(RestartActivity.EXTRA_SWF_URI, currentSwfUri)
+                }
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         )
