@@ -36,6 +36,7 @@ use backtrace::Backtrace;
 use jni::objects::JClass;
 
 use audio::AAudioAudioBackend;
+use std::collections::BTreeMap;
 use url::Url;
 
 use ruffle_common::duration::FloatDuration;
@@ -54,7 +55,7 @@ use ruffle_frontend_utils::{
     content::ContentDescriptor,
 };
 
-use crate::navigator::{AndroidNavigatorBackend, AndroidNavigatorInterface};
+use crate::navigator::{find_web_url_in_text, AndroidNavigatorBackend, AndroidNavigatorInterface};
 use crate::trace::FileLogBackend;
 use crate::ui::AndroidUiBackend;
 use java::JavaInterface;
@@ -207,7 +208,7 @@ struct AndroidExternalInterfaceProvider;
 impl ExternalInterfaceProvider for AndroidExternalInterfaceProvider {
     fn call_method(
         &self,
-        _context: &mut ruffle_core::context::UpdateContext<'_>,
+        context: &mut ruffle_core::context::UpdateContext<'_>,
         name: &str,
         args: &[ExternalValue],
     ) -> ExternalValue {
@@ -215,7 +216,7 @@ impl ExternalInterfaceProvider for AndroidExternalInterfaceProvider {
         let url = find_external_url(name, args);
         log::info!("ExternalInterface.call: {name} {args_json}");
         handle_external_interface_call(name, &args_json, url.as_deref());
-        ExternalValue::Undefined
+        emulate_page_external_method(context, name).unwrap_or(ExternalValue::Undefined)
     }
 
     fn on_callback_available(&self, name: &str) {
@@ -279,38 +280,73 @@ fn json_quote(value: &str) -> String {
 }
 
 fn find_external_url(name: &str, args: &[ExternalValue]) -> Option<String> {
-    find_url_in_text(name).or_else(|| args.iter().find_map(find_external_value_url))
+    find_web_url_in_text(name).or_else(|| args.iter().find_map(find_external_value_url))
 }
 
 fn find_external_value_url(value: &ExternalValue) -> Option<String> {
     match value {
-        ExternalValue::String(value) => find_url_in_text(value),
+        ExternalValue::String(value) => find_web_url_in_text(value),
         ExternalValue::List(values) => values.iter().find_map(find_external_value_url),
         ExternalValue::Object(values) => values.iter().find_map(|(key, value)| {
-            find_url_in_text(key).or_else(|| find_external_value_url(value))
+            find_web_url_in_text(key).or_else(|| find_external_value_url(value))
         }),
         _ => None,
     }
 }
 
-fn find_url_in_text(text: &str) -> Option<String> {
-    ["https://", "http://"].iter().find_map(|scheme| {
-        let start = text.find(scheme)?;
-        let tail = &text[start..];
-        let end = tail
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '[' | ']')
-            })
-            .unwrap_or(tail.len());
-        let url = tail[..end]
-            .trim_end_matches([',', ';', ')', '}'])
-            .to_string();
-        if url.is_empty() {
-            None
-        } else {
-            Some(url)
-        }
-    })
+fn emulate_page_external_method(
+    context: &ruffle_core::context::UpdateContext<'_>,
+    name: &str,
+) -> Option<ExternalValue> {
+    match external_method_name(name) {
+        "getHostname" => root_movie_url(context)
+            .and_then(|url| url.host_str().map(|host| host.to_string()))
+            .map(ExternalValue::String),
+        "getUrlParams" => Some(ExternalValue::Object(root_movie_query_params(context))),
+        "getSessionID" | "get_sid" => Some(
+            root_movie_query_param(context, "sid")
+                .map(ExternalValue::String)
+                .unwrap_or(ExternalValue::Undefined),
+        ),
+        "getSign" => Some(
+            root_movie_query_param(context, "sign")
+                .map(ExternalValue::String)
+                .unwrap_or(ExternalValue::Undefined),
+        ),
+        "getAd" => Some(ExternalValue::String("none".to_string())),
+        "is7k7kPlatform" => Some(ExternalValue::Bool(false)),
+        "addFav" | "addBookmark" => Some(ExternalValue::Bool(false)),
+        _ => None,
+    }
+}
+
+fn external_method_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+fn root_movie_query_param(
+    context: &ruffle_core::context::UpdateContext<'_>,
+    key: &str,
+) -> Option<String> {
+    root_movie_url(context)?
+        .query_pairs()
+        .find_map(|(name, value)| (name == key).then(|| value.into_owned()))
+}
+
+fn root_movie_query_params(
+    context: &ruffle_core::context::UpdateContext<'_>,
+) -> BTreeMap<String, ExternalValue> {
+    root_movie_url(context)
+        .map(|url| {
+            url.query_pairs()
+                .map(|(key, value)| (key.into_owned(), ExternalValue::String(value.into_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn root_movie_url(context: &ruffle_core::context::UpdateContext<'_>) -> Option<Url> {
+    Url::parse(context.root_swf.url()).ok()
 }
 
 struct ActivePlayerConfig<'a> {
@@ -526,7 +562,7 @@ fn recreate_player_surface(
     window: &ndk::native_window::NativeWindow,
     render_backend: RenderBackendPreference,
     render_scale: f64,
-    resume_playback: bool,
+    _resume_playback: bool,
 ) -> bool {
     if window.width() <= 0 || window.height() <= 0 {
         log::warn!(
@@ -591,14 +627,33 @@ fn recreate_player_surface(
         render_backend,
         render_scale,
     ));
-    if resume_playback {
-        player_lock.set_is_playing(true);
-    }
-
     true
 }
 
-fn set_audio_output(active_player: &ActivePlayer, enabled: bool) {
+fn release_player_surface(active_player: &ActivePlayer) {
+    let mut player_lock = match active_player.player.lock() {
+        Ok(player) => player,
+        Err(error) => {
+            log::warn!("Skipping surface release; player lock is poisoned: {error}");
+            return;
+        }
+    };
+
+    let Some(renderer) =
+        <dyn Any>::downcast_mut::<WgpuRenderBackend<SwapChainTarget>>(player_lock.renderer_mut())
+    else {
+        log::warn!("Skipping surface release; renderer backend type is unexpected");
+        return;
+    };
+
+    renderer.release_surface();
+}
+
+fn set_audio_output(active_player: &ActivePlayer, enabled: bool, current_enabled: &mut bool) {
+    if *current_enabled == enabled {
+        return;
+    }
+
     let mut player_lock = match active_player.player.lock() {
         Ok(player) => player,
         Err(error) => {
@@ -617,6 +672,7 @@ fn set_audio_output(active_player: &ActivePlayer, enabled: bool) {
     } else {
         audio.pause_output();
     }
+    *current_enabled = enabled;
 }
 
 #[tokio::main]
@@ -630,6 +686,8 @@ async fn run(app: AndroidApp) {
     let mut native_window: Option<ndk::native_window::NativeWindow> = None;
     let mut playerbox: Option<ActivePlayer> = None;
     let mut app_resumed = true;
+    let mut surface_attached = false;
+    let mut audio_output_enabled = false;
     let sender = EventSender {
         sender,
         waker: app.create_waker(),
@@ -749,23 +807,28 @@ async fn run(app: AndroidApp) {
                         last_frame_time = Instant::now();
                         next_frame_time = Some(last_frame_time);
                         if let Some(player) = playerbox.as_ref() {
-                            if let Some(window) = native_window.as_ref() {
-                                needs_redraw |= recreate_player_surface(
-                                    &app,
-                                    player,
-                                    window,
-                                    render_backend,
-                                    render_scale,
-                                    false,
-                                );
-                                set_audio_output(player, true);
+                            if !surface_attached {
+                                if let Some(window) = native_window.as_ref() {
+                                    surface_attached = recreate_player_surface(
+                                        &app,
+                                        player,
+                                        window,
+                                        render_backend,
+                                        render_scale,
+                                        false,
+                                    );
+                                    needs_redraw |= surface_attached;
+                                }
+                            }
+                            if surface_attached {
+                                set_audio_output(player, true, &mut audio_output_enabled);
                             }
                         }
                     }
                     MainEvent::Pause | MainEvent::Stop => {
                         app_resumed = false;
                         if let Some(player) = playerbox.as_ref() {
-                            set_audio_output(player, false);
+                            set_audio_output(player, false, &mut audio_output_enabled);
                         }
                     }
                     MainEvent::InitWindow { .. } => {
@@ -792,7 +855,7 @@ async fn run(app: AndroidApp) {
                         if let Some(activeplayer) = &playerbox {
                             last_frame_time = Instant::now();
                             next_frame_time = Some(last_frame_time);
-                            needs_redraw |= recreate_player_surface(
+                            surface_attached = recreate_player_surface(
                                 &app,
                                 activeplayer,
                                 window,
@@ -800,8 +863,9 @@ async fn run(app: AndroidApp) {
                                 render_scale,
                                 app_resumed,
                             );
-                            if app_resumed {
-                                set_audio_output(activeplayer, true);
+                            needs_redraw |= surface_attached;
+                            if app_resumed && surface_attached {
+                                set_audio_output(activeplayer, true, &mut audio_output_enabled);
                             }
                         } else if let Some(movie_url) = root_movie_url.as_ref() {
                             match create_active_player(
@@ -818,13 +882,25 @@ async fn run(app: AndroidApp) {
                                 },
                             ) {
                                 Ok(active_player) => {
+                                    surface_attached = true;
                                     playerbox = Some(active_player);
+                                    audio_output_enabled = true;
+                                    if !app_resumed {
+                                        if let Some(player) = playerbox.as_ref() {
+                                            set_audio_output(
+                                                player,
+                                                false,
+                                                &mut audio_output_enabled,
+                                            );
+                                        }
+                                    }
                                     last_frame_time = Instant::now();
                                     next_frame_time = Some(Instant::now());
 
                                     log::info!("MOVIE STARTED");
                                 }
                                 Err(error) => {
+                                    surface_attached = false;
                                     log::error!("Failed to create player: {error}");
                                     show_load_failure(&format!(
                                         "游戏渲染初始化失败，请切换渲染器后重试。\n{error}"
@@ -837,8 +913,10 @@ async fn run(app: AndroidApp) {
                     }
                     MainEvent::TerminateWindow { .. } => {
                         if let Some(player) = playerbox.as_ref() {
-                            set_audio_output(player, false);
+                            set_audio_output(player, false, &mut audio_output_enabled);
+                            release_player_surface(player);
                         }
+                        surface_attached = false;
                         native_window = None;
                     }
                     MainEvent::InputAvailable => {
@@ -1147,7 +1225,7 @@ async fn run(app: AndroidApp) {
         let new_time = Instant::now();
         let dt = new_time.duration_since(last_frame_time).as_micros();
         let can_tick = playerbox.is_some();
-        let can_render = app_resumed && native_window.is_some();
+        let can_render = app_resumed && native_window.is_some() && surface_attached;
         if can_tick && dt > 0 {
             last_frame_time = new_time;
             if let Some(player) = playerbox.as_ref() {
@@ -1155,12 +1233,14 @@ async fn run(app: AndroidApp) {
                     player.tick(FloatDuration::from_millis(dt as f64 / 1000.0));
                     next_frame_time = Some(new_time + player.time_til_next_frame());
                     needs_redraw = player.needs_render();
-                    if let Some(audio) =
-                        <dyn Any>::downcast_mut::<AAudioAudioBackend>(player.audio_mut())
-                    {
-                        audio.recreate_stream_if_needed();
-                    } else {
-                        log::warn!("Skipping audio stream maintenance; audio backend mismatch");
+                    if audio_output_enabled {
+                        if let Some(audio) =
+                            <dyn Any>::downcast_mut::<AAudioAudioBackend>(player.audio_mut())
+                        {
+                            audio.recreate_stream_if_needed();
+                        } else {
+                            log::warn!("Skipping audio stream maintenance; audio backend mismatch");
+                        }
                     }
                 }
             } else {
