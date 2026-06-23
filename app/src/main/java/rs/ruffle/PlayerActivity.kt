@@ -13,8 +13,10 @@ import android.net.Uri
 import android.os.Build
 import android.os.Build.VERSION_CODES
 import android.os.Bundle
+import android.os.Debug
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.text.TextUtils
 import android.util.Log
@@ -128,6 +130,7 @@ class PlayerActivity : GameActivity() {
 
     private lateinit var ruffleInputView: RuffleInputView
     private lateinit var diagnosticOverlay: LinearLayout
+    private lateinit var runtimeMetricsView: TextView
     private lateinit var fpsView: TextView
     private lateinit var serverMetricsView: TextView
     private lateinit var versionView: TextView
@@ -141,6 +144,15 @@ class PlayerActivity : GameActivity() {
     private var imeWasVisible = false
     private var consumeImeDismissTouch = false
     private var hoverClickModeEnabled = false
+    private val runtimeMetricsHandler = Handler(Looper.getMainLooper())
+    private var lastRuntimeMetricsRealtimeMs = 0L
+    private var lastRuntimeMetricsCpuMs = 0L
+    private val runtimeMetricsRunnable = object : Runnable {
+        override fun run() {
+            updateRuntimeMetrics()
+            runtimeMetricsHandler.postDelayed(this, RUNTIME_METRICS_INTERVAL_MS)
+        }
+    }
     private val audioManager: AudioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
@@ -500,6 +512,7 @@ class PlayerActivity : GameActivity() {
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
+        runtimeMetricsView = overlayTextView("MEM PSS:0M Java:0M\nNative:0M GFX:0M CPU:0%")
         fpsView = overlayTextView("FPS:0")
         serverMetricsView = TextView(this).apply {
             text = "hit:0\nexpired:0\nfetch:0\ncached:0\nchecked:0"
@@ -514,9 +527,11 @@ class PlayerActivity : GameActivity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         versionView = overlayTextView("v${appVersionName()}")
+        diagnosticOverlay.addView(runtimeMetricsView)
         diagnosticOverlay.addView(fpsView)
         diagnosticOverlay.addView(serverMetricsView)
         diagnosticOverlay.addView(versionView)
+        startRuntimeMetricsOverlay()
         layout.addView(
             diagnosticOverlay,
             ConstraintLayout.LayoutParams(
@@ -1062,6 +1077,66 @@ class PlayerActivity : GameActivity() {
         }
     }
 
+    private fun startRuntimeMetricsOverlay() {
+        runtimeMetricsHandler.removeCallbacks(runtimeMetricsRunnable)
+        lastRuntimeMetricsRealtimeMs = 0L
+        lastRuntimeMetricsCpuMs = 0L
+        updateRuntimeMetrics()
+        runtimeMetricsHandler.postDelayed(runtimeMetricsRunnable, RUNTIME_METRICS_INTERVAL_MS)
+    }
+
+    private fun stopRuntimeMetricsOverlay() {
+        runtimeMetricsHandler.removeCallbacks(runtimeMetricsRunnable)
+    }
+
+    private fun updateRuntimeMetrics() {
+        if (!::runtimeMetricsView.isInitialized) {
+            return
+        }
+
+        val nowMs = SystemClock.elapsedRealtime()
+        val cpuMs = android.os.Process.getElapsedCpuTime()
+        val cpuPercent = if (lastRuntimeMetricsRealtimeMs > 0L) {
+            val elapsedMs = (nowMs - lastRuntimeMetricsRealtimeMs).coerceAtLeast(1L)
+            val usedCpuMs = (cpuMs - lastRuntimeMetricsCpuMs).coerceAtLeast(0L)
+            usedCpuMs.toDouble() * 100.0 / elapsedMs.toDouble()
+        } else {
+            0.0
+        }
+        lastRuntimeMetricsRealtimeMs = nowMs
+        lastRuntimeMetricsCpuMs = cpuMs
+
+        val memoryInfo = Debug.MemoryInfo()
+        Debug.getMemoryInfo(memoryInfo)
+        val runtime = Runtime.getRuntime()
+        val javaHeapBytes = runtime.totalMemory() - runtime.freeMemory()
+        val nativeHeapBytes = Debug.getNativeHeapAllocatedSize()
+        val graphicsBytes = memoryInfo.getMemoryStat("summary.graphics")
+            ?.toLongOrNull()
+            ?.toDouble()
+            ?.times(1024.0)
+            ?: 0.0
+
+        runtimeMetricsView.text = String.format(
+            Locale.US,
+            "MEM PSS:%s Java:%s\nNative:%s GFX:%s CPU:%.0f%%",
+            formatMiB(memoryInfo.totalPss * 1024.0),
+            formatMiB(javaHeapBytes.toDouble()),
+            formatMiB(nativeHeapBytes.toDouble()),
+            formatMiB(graphicsBytes),
+            cpuPercent
+        )
+    }
+
+    private fun formatMiB(bytes: Double): String {
+        val mib = bytes / (1024.0 * 1024.0)
+        return if (mib >= 100.0) {
+            String.format(Locale.US, "%.0fM", mib)
+        } else {
+            String.format(Locale.US, "%.1fM", mib)
+        }
+    }
+
     private fun overlayTextView(initialText: String): TextView = TextView(this).apply {
         text = initialText
         setTextColor(Color.WHITE)
@@ -1461,6 +1536,7 @@ class PlayerActivity : GameActivity() {
     }
 
     override fun onDestroy() {
+        stopRuntimeMetricsOverlay()
         if (isFinishing) {
             KeepAliveService.stop(this)
         }
@@ -1635,6 +1711,7 @@ class PlayerActivity : GameActivity() {
         private const val CRASH_PREFS_NAME = "crash_logs"
         private const val KEY_PENDING_CRASH = "pending_native_panic"
         private const val HEALTH_NOTICE_MS = 1000L
+        private const val RUNTIME_METRICS_INTERVAL_MS = 1000L
         private const val IME_DELETE_SENTINEL = "\u200b"
         private const val MAX_IME_DELETE_REPEAT = 8
         private const val MAX_IME_SHADOW_CHARS = 64
