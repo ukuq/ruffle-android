@@ -19,6 +19,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, MutexGuard};
 use std::time::Duration;
@@ -689,7 +690,7 @@ async fn run(app: AndroidApp) {
     let root_movie_url =
         external_movie_url.or_else(|| seer2_server.as_ref().map(|server| server.movie_url()));
     if let Some(server) = seer2_server.as_ref() {
-        start_server_metrics_overlay(server.metrics());
+        start_server_metrics_overlay(server.metrics(), server.shutdown_token());
     }
 
     while !quit {
@@ -1374,10 +1375,10 @@ fn handle_external_interface_call(name: &str, args: &str, url: Option<&str>) {
     }
 }
 
-fn start_server_metrics_overlay(metrics: Arc<seer2::CacheMetrics>) {
+fn start_server_metrics_overlay(metrics: Arc<seer2::CacheMetrics>, shutdown: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut last = String::new();
-        loop {
+        while !shutdown.load(Ordering::Relaxed) {
             let text = metrics.snapshot_text();
             if text != last {
                 update_server_metrics(&text);

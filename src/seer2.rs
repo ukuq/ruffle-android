@@ -2,12 +2,13 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, FileTimes};
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -22,6 +23,7 @@ const FAVICON_PATH: &str = "/favicon.ico";
 const BLOOM_PATH: &str = "/config/bloom-path.data";
 const LOCAL_ENTRY_PATH: &str = "/seer2/play-local.html";
 const CLIENT_SWF_PATH: &str = "/seer2/Client.swf";
+const MAX_LOCAL_CONNECTIONS: usize = 64;
 const LOAD_FAILED_PREFIX: &str =
     "\u{6e38}\u{620f}\u{52a0}\u{8f7d}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{540e}\u{91cd}\u{8bd5}\u{3002}";
 
@@ -38,6 +40,8 @@ struct ServerState {
     bloom: Bloom,
     cache_dir: PathBuf,
     file_locks: Mutex<HashSet<String>>,
+    cache_check_locks: Mutex<HashSet<String>>,
+    active_connections: AtomicUsize,
     metrics: Arc<CacheMetrics>,
     load_failure_notifier: Option<LoadFailureNotifier>,
     load_failure_reported: Mutex<bool>,
@@ -47,6 +51,8 @@ pub struct HttpServer {
     address: SocketAddr,
     _state: Arc<ServerState>,
     metrics: Arc<CacheMetrics>,
+    shutdown: Arc<AtomicBool>,
+    accept_thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -100,15 +106,45 @@ impl HttpServer {
         let state = Arc::new(create_state(app_data_dir, load_failure_notifier)?);
         let metrics = Arc::clone(&state.metrics);
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let server_state = Arc::clone(&state);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
 
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
+        let accept_thread = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if server_state
+                            .active_connections
+                            .fetch_add(1, Ordering::Relaxed)
+                            >= MAX_LOCAL_CONNECTIONS
+                        {
+                            server_state
+                                .active_connections
+                                .fetch_sub(1, Ordering::Relaxed);
+                            let _ = write_http_response(
+                                &mut stream,
+                                response(
+                                    503,
+                                    "text/plain; charset=utf-8",
+                                    b"too many local connections".to_vec(),
+                                ),
+                                false,
+                            );
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+
                         let state = Arc::clone(&server_state);
-                        thread::spawn(move || handle_connection(state, stream));
+                        thread::spawn(move || {
+                            handle_connection(Arc::clone(&state), stream);
+                            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
                     }
                     Err(err) => log::warn!("Seer2 local server accept failed: {}", err),
                 }
@@ -120,6 +156,8 @@ impl HttpServer {
             address,
             _state: state,
             metrics,
+            shutdown,
+            accept_thread: Some(accept_thread),
         })
     }
 
@@ -130,8 +168,22 @@ impl HttpServer {
     pub fn metrics(&self) -> Arc<CacheMetrics> {
         Arc::clone(&self.metrics)
     }
+
+    pub fn shutdown_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
 }
 
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.accept_thread.take() {
+            if handle.join().is_err() {
+                log::warn!("Seer2 local server accept thread panicked during shutdown");
+            }
+        }
+    }
+}
 impl CacheMetrics {
     fn increment(&self, metric: CacheMetric) {
         match metric {
@@ -180,6 +232,8 @@ fn create_state(
         bloom,
         cache_dir,
         file_locks: Mutex::new(HashSet::new()),
+        cache_check_locks: Mutex::new(HashSet::new()),
+        active_connections: AtomicUsize::new(0),
         metrics: Arc::new(CacheMetrics::default()),
         load_failure_notifier,
         load_failure_reported: Mutex::new(false),
@@ -264,26 +318,24 @@ fn handle_connection(state: Arc<ServerState>, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
-    let response = match read_http_request(&mut stream) {
+    let (response, is_head) = match read_http_request(&mut stream) {
         Ok(Some((method, target))) => {
             let is_head = method.eq_ignore_ascii_case("HEAD");
-            match handle_target(Arc::clone(&state), &target) {
-                Ok(response) => to_http_response(response, is_head),
-                Err(err) => to_http_response(
-                    response(
-                        500,
-                        "text/plain; charset=utf-8",
-                        format!("server error: {err}").into_bytes(),
-                    ),
-                    is_head,
+            let response = match handle_target(Arc::clone(&state), &target) {
+                Ok(response) => response,
+                Err(err) => response(
+                    500,
+                    "text/plain; charset=utf-8",
+                    format!("server error: {err}").into_bytes(),
                 ),
-            }
+            };
+            (response, is_head)
         }
-        Ok(None) => to_http_response(
+        Ok(None) => (
             response(400, "text/plain; charset=utf-8", b"bad request".to_vec()),
             false,
         ),
-        Err(err) => to_http_response(
+        Err(err) => (
             response(
                 500,
                 "text/plain; charset=utf-8",
@@ -293,11 +345,10 @@ fn handle_connection(state: Arc<ServerState>, mut stream: TcpStream) {
         ),
     };
 
-    let _ = stream.write_all(&response);
+    let _ = write_http_response(&mut stream, response, is_head);
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Both);
 }
-
 fn read_http_request(
     stream: &mut TcpStream,
 ) -> Result<Option<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -471,29 +522,33 @@ fn http_get_once(
 }
 
 fn parse_http_response(
-    bytes: Vec<u8>,
+    mut bytes: Vec<u8>,
 ) -> Result<RemoteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let header_end = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .ok_or("malformed HTTP response")?;
-    let header_text = String::from_utf8_lossy(&bytes[..header_end]);
-    let mut lines = header_text.split("\r\n");
-    let status_line = lines.next().ok_or("missing HTTP status line")?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or("missing HTTP status")?
-        .parse::<u16>()?;
+    let (status, headers) = {
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let mut lines = header_text.split("\r\n");
+        let status_line = lines.next().ok_or("missing HTTP status line")?;
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or("missing HTTP status")?
+            .parse::<u16>()?;
 
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
         }
-    }
+        (status, headers)
+    };
 
-    let mut body = bytes[header_end + 4..].to_vec();
+    bytes.drain(..header_end + 4);
+    let mut body = bytes;
     if headers
         .get("transfer-encoding")
         .map(|value| {
@@ -517,7 +572,6 @@ fn parse_http_response(
         body,
     })
 }
-
 fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut output = Vec::new();
     let mut cursor = 0;
@@ -685,22 +739,10 @@ fn fetch_and_cache(
     let body = remote.body;
 
     if status == 200 {
-        let state_for_write = Arc::clone(&state);
-        let bloom_path = bloom_path.to_string();
-        let body_for_write = body.clone();
-        thread::spawn(move || {
-            if let Err(err) = write_cache(
-                &state_for_write,
-                &bloom_path,
-                &cache_path,
-                &body_for_write,
-                modified,
-            ) {
-                log::warn!("Seer2 cache write error: {}", err);
-            }
-        });
+        if let Err(err) = write_cache(&state, bloom_path, &cache_path, &body, modified) {
+            log::warn!("Seer2 cache write error: {}", err);
+        }
     }
-
     let mut res = response(status, content_type(url_path), body);
     res.headers.push(("x-hit".into(), "fetch".into()));
     Ok(res)
@@ -712,15 +754,29 @@ fn spawn_async_cache_check(
     cache_path: PathBuf,
     modified: SystemTime,
 ) {
+    {
+        let mut locks = match state.cache_check_locks.lock() {
+            Ok(locks) => locks,
+            Err(_) => return,
+        };
+        if !locks.insert(bloom_path.clone()) {
+            return;
+        }
+    }
+
     thread::spawn(move || {
-        if let Err(err) = async_check_cache(state, &bloom_path, &cache_path, modified) {
+        let result = async_check_cache(&state, &bloom_path, &cache_path, modified);
+        if let Ok(mut locks) = state.cache_check_locks.lock() {
+            locks.remove(&bloom_path);
+        }
+        if let Err(err) = result {
             log::warn!("Seer2 async cache check error: {}", err);
         }
     });
 }
 
 fn async_check_cache(
-    state: Arc<ServerState>,
+    state: &ServerState,
     bloom_path: &str,
     cache_path: &Path,
     modified: SystemTime,
@@ -754,15 +810,8 @@ fn async_check_cache(
     }
 
     log::info!("Seer2 cache changed: {}", bloom_path);
-    write_cache(
-        &state,
-        bloom_path,
-        cache_path,
-        &remote.body,
-        remote_modified,
-    )
+    write_cache(state, bloom_path, cache_path, &remote.body, remote_modified)
 }
-
 fn notify_game_load_failure(state: &ServerState, message: String) {
     let Some(notifier) = &state.load_failure_notifier else {
         return;
@@ -854,29 +903,32 @@ fn redirect(location: String) -> Response {
     }
 }
 
-fn to_http_response(response: Response, is_head: bool) -> Vec<u8> {
+fn write_http_response(
+    stream: &mut TcpStream,
+    response: Response,
+    is_head: bool,
+) -> io::Result<()> {
     let body_len = response.body.len();
     let status_text = status_text(response.status);
-    let mut output = format!(
+    write!(
+        stream,
         "HTTP/1.1 {} {}\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\nconnection: close\r\n",
         response.status, status_text, body_len
-    )
-    .into_bytes();
+    )?;
 
     for (name, value) in response.headers {
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(b": ");
-        output.extend_from_slice(value.as_bytes());
-        output.extend_from_slice(b"\r\n");
+        stream.write_all(name.as_bytes())?;
+        stream.write_all(b": ")?;
+        stream.write_all(value.as_bytes())?;
+        stream.write_all(b"\r\n")?;
     }
 
-    output.extend_from_slice(b"\r\n");
+    stream.write_all(b"\r\n")?;
     if !is_head {
-        output.extend_from_slice(&response.body);
+        stream.write_all(&response.body)?;
     }
-    output
+    Ok(())
 }
-
 fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -886,6 +938,7 @@ fn status_text(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
