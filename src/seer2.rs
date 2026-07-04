@@ -23,9 +23,29 @@ const FAVICON_PATH: &str = "/favicon.ico";
 const BLOOM_PATH: &str = "/config/bloom-path.data";
 const LOCAL_ENTRY_PATH: &str = "/seer2/play-local.html";
 const CLIENT_SWF_PATH: &str = "/seer2/Client.swf";
+const WEBVIEW_RENDERER_PATH: &str = "/seer2/webview-renderer.html";
+const WEBVIEW_HTTP_PROXY_PATH: &str = "/seer2/webview-http-proxy";
+const WEBVIEW_SOCKET_PROXY_PATH: &str = "/seer2/webview-socket-proxy";
+const RUFFLE_JS_PATH: &str = "/seer2/ruffle.js";
+const RUFFLE_JS_MAP_PATH: &str = "/seer2/ruffle.js.map";
+const RUFFLE_CORE_JS_PATH: &str = "/seer2/core.ruffle.f9ef39952cb0d30efac2.js";
+const RUFFLE_CORE_JS_MAP_PATH: &str = "/seer2/core.ruffle.f9ef39952cb0d30efac2.js.map";
+const RUFFLE_WASM_PATH: &str = "/seer2/32aa5c0c6453ffd9ea2e.wasm";
 const MAX_LOCAL_CONNECTIONS: usize = 64;
+const MAX_WEBSOCKET_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const LOAD_FAILED_PREFIX: &str =
     "\u{6e38}\u{620f}\u{52a0}\u{8f7d}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{540e}\u{91cd}\u{8bd5}\u{3002}";
+const WEBVIEW_RENDERER_HTML: &[u8] = include_bytes!("../app/src/main/assets/webview-renderer.html");
+const RUFFLE_JS: &[u8] = include_bytes!("../../ruffle/web/packages/selfhosted/dist/ruffle.js");
+const RUFFLE_JS_MAP: &[u8] =
+    include_bytes!("../../ruffle/web/packages/selfhosted/dist/ruffle.js.map");
+const RUFFLE_CORE_JS: &[u8] =
+    include_bytes!("../../ruffle/web/packages/selfhosted/dist/core.ruffle.f9ef39952cb0d30efac2.js");
+const RUFFLE_CORE_JS_MAP: &[u8] = include_bytes!(
+    "../../ruffle/web/packages/selfhosted/dist/core.ruffle.f9ef39952cb0d30efac2.js.map"
+);
+const RUFFLE_WASM: &[u8] =
+    include_bytes!("../../ruffle/web/packages/selfhosted/dist/32aa5c0c6453ffd9ea2e.wasm");
 
 pub type LoadFailureNotifier = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -76,6 +96,12 @@ enum CacheMetric {
 struct Request {
     path: String,
     query: Option<String>,
+}
+
+struct RequestHead {
+    method: String,
+    target: String,
+    headers: HashMap<String, String>,
 }
 
 struct Response {
@@ -165,6 +191,15 @@ impl HttpServer {
         format!("http://{}{}", self.address, CLIENT_SWF_PATH)
     }
 
+    pub fn web_renderer_url(&self, movie_url: &str) -> String {
+        let encoded_movie_url: String =
+            url::form_urlencoded::byte_serialize(movie_url.as_bytes()).collect();
+        format!(
+            "http://{}{}?swf={encoded_movie_url}",
+            self.address, WEBVIEW_RENDERER_PATH
+        )
+    }
+
     pub fn metrics(&self) -> Arc<CacheMetrics> {
         Arc::clone(&self.metrics)
     }
@@ -184,6 +219,7 @@ impl Drop for HttpServer {
         }
     }
 }
+
 impl CacheMetrics {
     fn increment(&self, metric: CacheMetric) {
         match metric {
@@ -319,9 +355,16 @@ fn handle_connection(state: Arc<ServerState>, mut stream: TcpStream) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
     let (response, is_head) = match read_http_request(&mut stream) {
-        Ok(Some((method, target))) => {
-            let is_head = method.eq_ignore_ascii_case("HEAD");
-            let response = match handle_target(Arc::clone(&state), &target) {
+        Ok(Some(request)) => {
+            if is_websocket_upgrade(&request) {
+                if let Err(err) = handle_websocket_proxy(request, stream) {
+                    log::warn!("WebView socket proxy error: {err}");
+                }
+                return;
+            }
+
+            let is_head = request.method.eq_ignore_ascii_case("HEAD");
+            let response = match handle_target(Arc::clone(&state), &request.target) {
                 Ok(response) => response,
                 Err(err) => response(
                     500,
@@ -351,7 +394,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: TcpStream) {
 }
 fn read_http_request(
     stream: &mut TcpStream,
-) -> Result<Option<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<RequestHead>, Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 1024];
 
@@ -367,7 +410,8 @@ fn read_http_request(
     }
 
     let text = String::from_utf8_lossy(&buffer);
-    let first_line = text.lines().next().unwrap_or_default();
+    let mut lines = text.lines();
+    let first_line = lines.next().unwrap_or_default();
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
@@ -375,7 +419,211 @@ fn read_http_request(
         return Ok(None);
     }
 
-    Ok(Some((method.to_string(), target.to_string())))
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    Ok(Some(RequestHead {
+        method: method.to_string(),
+        target: target.to_string(),
+        headers,
+    }))
+}
+
+fn is_websocket_upgrade(request: &RequestHead) -> bool {
+    request
+        .headers
+        .get("upgrade")
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
+fn handle_websocket_proxy(
+    request: RequestHead,
+    mut browser_stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (path, query) = request
+        .target
+        .split_once('?')
+        .unwrap_or((&request.target, ""));
+    if normalized_path(path) != WEBVIEW_SOCKET_PROXY_PATH {
+        write_http_response(
+            &mut browser_stream,
+            response(404, "text/plain; charset=utf-8", b"not found".to_vec()),
+            false,
+        )?;
+        return Ok(());
+    }
+
+    let host = query_value(Some(query), "host").ok_or("missing socket proxy host")?;
+    let port = query_value(Some(query), "port")
+        .ok_or("missing socket proxy port")?
+        .parse::<u16>()
+        .map_err(|err| format!("invalid socket proxy port: {err}"))?;
+    let websocket_key = request
+        .headers
+        .get("sec-websocket-key")
+        .ok_or("missing Sec-WebSocket-Key")?;
+    let accept = websocket_accept_key(websocket_key);
+
+    let target_address = (host.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or("socket proxy target did not resolve")?;
+    let target_stream = TcpStream::connect_timeout(&target_address, Duration::from_secs(20))?;
+    let _ = target_stream.set_nodelay(true);
+    let _ = browser_stream.set_nodelay(true);
+    let _ = browser_stream.set_read_timeout(None);
+    let _ = browser_stream.set_write_timeout(None);
+
+    write!(
+        browser_stream,
+        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+    )?;
+    browser_stream.flush()?;
+    log::info!("WebView socket proxy connected {host}:{port}");
+
+    tunnel_websocket_to_tcp(browser_stream, target_stream)
+}
+
+fn tunnel_websocket_to_tcp(
+    browser_stream: TcpStream,
+    target_stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut browser_reader = browser_stream.try_clone()?;
+    let browser_writer = Arc::new(Mutex::new(browser_stream));
+    let mut target_reader = target_stream.try_clone()?;
+    let mut target_writer = target_stream;
+    let browser_writer_for_client = Arc::clone(&browser_writer);
+
+    let client_to_target = thread::spawn(move || -> io::Result<()> {
+        loop {
+            match read_client_websocket_frame(&mut browser_reader)? {
+                WebSocketFrame::Data(data) => {
+                    target_writer.write_all(&data)?;
+                    target_writer.flush()?;
+                }
+                WebSocketFrame::Ping(data) => {
+                    if let Ok(mut writer) = browser_writer_for_client.lock() {
+                        write_websocket_frame(&mut writer, 0xA, &data)?;
+                    }
+                }
+                WebSocketFrame::Pong => {}
+                WebSocketFrame::Close => break,
+            }
+        }
+        let _ = target_writer.shutdown(Shutdown::Both);
+        Ok(())
+    });
+
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let len = match target_reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(len) => len,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(Box::new(err)),
+        };
+
+        let mut writer = browser_writer
+            .lock()
+            .map_err(|_| "websocket writer lock poisoned")?;
+        write_websocket_frame(&mut writer, 0x2, &buffer[..len])?;
+    }
+
+    if let Ok(mut writer) = browser_writer.lock() {
+        let _ = write_websocket_frame(&mut writer, 0x8, &[]);
+        let _ = writer.shutdown(Shutdown::Both);
+    }
+    match client_to_target.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if err.kind() == ErrorKind::UnexpectedEof => {}
+        Ok(Err(err)) if err.kind() == ErrorKind::ConnectionReset => {}
+        Ok(Err(err)) => log::warn!("WebView socket proxy read error: {err}"),
+        Err(_) => log::warn!("WebView socket proxy thread panicked"),
+    }
+    Ok(())
+}
+
+enum WebSocketFrame {
+    Data(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong,
+    Close,
+}
+
+fn read_client_websocket_frame(stream: &mut TcpStream) -> io::Result<WebSocketFrame> {
+    let mut header = [0_u8; 2];
+    stream.read_exact(&mut header)?;
+    let opcode = header[0] & 0x0f;
+    let masked = (header[1] & 0x80) != 0;
+    let mut payload_len = u64::from(header[1] & 0x7f);
+    if payload_len == 126 {
+        let mut extended = [0_u8; 2];
+        stream.read_exact(&mut extended)?;
+        payload_len = u64::from(u16::from_be_bytes(extended));
+    } else if payload_len == 127 {
+        let mut extended = [0_u8; 8];
+        stream.read_exact(&mut extended)?;
+        payload_len = u64::from_be_bytes(extended);
+    }
+    if payload_len > MAX_WEBSOCKET_FRAME_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "websocket frame is too large",
+        ));
+    }
+
+    let mut mask = [0_u8; 4];
+    if masked {
+        stream.read_exact(&mut mask)?;
+    }
+    let mut payload = vec![0_u8; payload_len as usize];
+    stream.read_exact(&mut payload)?;
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+
+    match opcode {
+        0x0 | 0x1 | 0x2 => Ok(WebSocketFrame::Data(payload)),
+        0x8 => Ok(WebSocketFrame::Close),
+        0x9 => Ok(WebSocketFrame::Ping(payload)),
+        0xA => Ok(WebSocketFrame::Pong),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unsupported websocket opcode: {opcode}"),
+        )),
+    }
+}
+
+fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    let mut header = vec![0x80 | (opcode & 0x0f)];
+    if payload.len() < 126 {
+        header.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        header.push(126);
+        header.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        header.push(127);
+        header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    stream.write_all(&header)?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+fn websocket_accept_key(key: &str) -> String {
+    let mut data = key.trim().as_bytes().to_vec();
+    data.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    STANDARD.encode(sha1_digest(&data))
 }
 
 fn handle_target(
@@ -636,6 +884,26 @@ fn handle_request(
             "application/xml; charset=utf-8",
             FLASH_POLICY_DATA.as_bytes().to_vec(),
         ));
+    }
+    if url_path == WEBVIEW_HTTP_PROXY_PATH {
+        let Some(target_url) = query_value(request.query.as_deref(), "url") else {
+            return Ok(response(
+                400,
+                "text/plain; charset=utf-8",
+                b"missing proxy url".to_vec(),
+            ));
+        };
+        return match Url::parse(&target_url) {
+            Ok(url) => fetch_absolute_proxy(url),
+            Err(err) => Ok(response(
+                400,
+                "text/plain; charset=utf-8",
+                format!("invalid proxy url: {err}").into_bytes(),
+            )),
+        };
+    }
+    if let Some(asset) = web_renderer_asset(&url_path) {
+        return Ok(response(200, content_type(&url_path), asset.to_vec()));
     }
     if url_path.ends_with('/') || url_path.ends_with('\\') || !url_path.starts_with(SEER2_PATH) {
         return Ok(response(
@@ -952,6 +1220,18 @@ fn entry_url(origin: &str) -> String {
     )
 }
 
+fn web_renderer_asset(path: &str) -> Option<&'static [u8]> {
+    match path {
+        WEBVIEW_RENDERER_PATH => Some(WEBVIEW_RENDERER_HTML),
+        RUFFLE_JS_PATH => Some(RUFFLE_JS),
+        RUFFLE_JS_MAP_PATH => Some(RUFFLE_JS_MAP),
+        RUFFLE_CORE_JS_PATH => Some(RUFFLE_CORE_JS),
+        RUFFLE_CORE_JS_MAP_PATH => Some(RUFFLE_CORE_JS_MAP),
+        RUFFLE_WASM_PATH => Some(RUFFLE_WASM),
+        _ => None,
+    }
+}
+
 fn local_origin() -> String {
     "http://127.0.0.1".to_string()
 }
@@ -962,6 +1242,11 @@ fn query_has_key(query: Option<&str>, key: &str) -> bool {
         .split('&')
         .filter_map(|pair| pair.split_once('=').map(|(name, _)| name).or(Some(pair)))
         .any(|name| name == key)
+}
+
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .find_map(|(name, value)| (name == key).then(|| value.into_owned()))
 }
 
 fn is_file_locked(state: &ServerState, bloom_path: &str) -> bool {
@@ -1003,6 +1288,78 @@ fn md5_hex(data: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut message = data.to_vec();
+    let bit_len = (message.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut h0 = 0x67452301_u32;
+    let mut h1 = 0xefcdab89_u32;
+    let mut h2 = 0x98badcfe_u32;
+    let mut h3 = 0x10325476_u32;
+    let mut h4 = 0xc3d2e1f0_u32;
+
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0_u32; 80];
+        for i in 0..16 {
+            let offset = i * 4;
+            words[i] = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for i in 16..80 {
+            words[i] = (words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for (i, word) in words.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => (((b & c) | ((!b) & d)), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => (((b & c) | (b & d) | (c & d)), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut digest = [0_u8; 20];
+    digest[0..4].copy_from_slice(&h0.to_be_bytes());
+    digest[4..8].copy_from_slice(&h1.to_be_bytes());
+    digest[8..12].copy_from_slice(&h2.to_be_bytes());
+    digest[12..16].copy_from_slice(&h3.to_be_bytes());
+    digest[16..20].copy_from_slice(&h4.to_be_bytes());
+    digest
 }
 
 fn md5_digest(data: &[u8]) -> [u8; 16] {
@@ -1255,11 +1612,19 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{md5_hex, parse_http_date};
+    use super::{md5_hex, parse_http_date, websocket_accept_key};
 
     #[test]
     fn md5_matches_known_value() {
         assert_eq!(md5_hex(b"/Client.swf"), "977aa655fe7d23685d06345dcf2fe114");
+    }
+
+    #[test]
+    fn websocket_accept_matches_rfc_example() {
+        assert_eq!(
+            websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 
     #[test]

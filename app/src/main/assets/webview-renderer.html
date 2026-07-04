@@ -1,0 +1,381 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    >
+    <style>
+        html,
+        body,
+        #container {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+
+        body {
+            position: fixed;
+            inset: 0;
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        #container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #viewport {
+            position: relative;
+            overflow: visible;
+        }
+
+        #stage {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 1200px;
+            height: 660px;
+            transform-origin: 0 0;
+        }
+
+        ruffle-player {
+            display: block;
+            width: 1200px;
+            height: 660px;
+            outline: none;
+            background: #000;
+        }
+    </style>
+    <script>
+        window.RufflePlayer = window.RufflePlayer || {};
+        window.RufflePlayer.config = {
+            publicPath: "./",
+            polyfills: false,
+            autoplay: "on",
+            unmuteOverlay: "hidden",
+            letterbox: "on",
+            scale: "showAll",
+            allowScriptAccess: true,
+            allowNetworking: "all",
+            openUrlMode: "allow",
+            httpProxy: [
+                {
+                    origin: "*",
+                    proxyUrl: "./webview-http-proxy"
+                }
+            ],
+            socketProxy: [
+                {
+                    host: "*",
+                    port: 0,
+                    proxyUrl: "ws://" + window.location.host + "/seer2/webview-socket-proxy"
+                }
+            ],
+            showSwfDownload: false,
+            contextMenu: false,
+            backgroundColor: "#000000"
+        };
+
+        function androidLog(message) {
+            if (window.RuffleAndroid && window.RuffleAndroid.log) {
+                window.RuffleAndroid.log(String(message));
+            }
+        }
+
+        function toPayload(value) {
+            if (typeof value === "string") {
+                return value;
+            }
+            try {
+                return JSON.stringify(value);
+            } catch (error) {
+                return String(value);
+            }
+        }
+
+        function sendExternal(name, payload) {
+            if (window.RuffleAndroid && window.RuffleAndroid.postMessage) {
+                window.RuffleAndroid.postMessage(String(name), toPayload(payload));
+            }
+        }
+
+        let ruffleAndroidClickDisabled = false;
+        const ruffleAndroidClickEvents = [
+            "pointerdown",
+            "pointerup",
+            "pointercancel",
+            "pointerout",
+            "pointerleave",
+            "mousedown",
+            "mouseup",
+            "mouseout",
+            "mouseleave",
+            "click",
+            "dblclick",
+            "contextmenu",
+            "touchstart",
+            "touchend",
+            "touchcancel"
+        ];
+        const ruffleAndroidHoverEvents = new Set([
+            "pointerdown",
+            "pointerup",
+            "mousedown",
+            "mouseup",
+            "touchstart",
+            "touchend"
+        ]);
+        let ruffleAndroidLastPointerHoverMs = 0;
+        let ruffleAndroidClickCaptureTarget = null;
+
+        function ruffleAndroidCanvas() {
+            const player = document.querySelector("ruffle-player");
+            return (
+                (player && player.shadowRoot && player.shadowRoot.querySelector("canvas")) ||
+                document.querySelector("canvas")
+            );
+        }
+
+        function ruffleAndroidEventPoint(event) {
+            if (event.changedTouches && event.changedTouches.length > 0) {
+                return event.changedTouches[0];
+            }
+            if (event.touches && event.touches.length > 0) {
+                return event.touches[0];
+            }
+            return event;
+        }
+
+        function setSyntheticOffset(event, canvas, point) {
+            const rect = canvas.getBoundingClientRect();
+            const offsetX = ((point.clientX - rect.left) * canvas.clientWidth) / rect.width;
+            const offsetY = ((point.clientY - rect.top) * canvas.clientHeight) / rect.height;
+            if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY)) {
+                return;
+            }
+
+            try {
+                Object.defineProperty(event, "offsetX", { value: offsetX });
+                Object.defineProperty(event, "offsetY", { value: offsetY });
+            } catch (error) {
+                androidLog(
+                    "Unable to set synthetic hover offset: " +
+                        (error && error.message ? error.message : error)
+                );
+            }
+        }
+
+        function synthesizeRuffleAndroidHover(event) {
+            if (!ruffleAndroidHoverEvents.has(event.type) || !window.PointerEvent) {
+                return;
+            }
+
+            const isPointerEvent = event instanceof PointerEvent;
+            const now = performance.now();
+            if (!isPointerEvent && now - ruffleAndroidLastPointerHoverMs < 250) {
+                return;
+            }
+
+            const canvas = ruffleAndroidCanvas();
+            const point = ruffleAndroidEventPoint(event);
+            if (
+                !canvas ||
+                typeof point.clientX !== "number" ||
+                typeof point.clientY !== "number"
+            ) {
+                return;
+            }
+
+            const hoverEvent = new PointerEvent("pointermove", {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                clientX: point.clientX,
+                clientY: point.clientY,
+                screenX: point.screenX || 0,
+                screenY: point.screenY || 0,
+                pointerId: isPointerEvent ? event.pointerId : 1,
+                pointerType: isPointerEvent ? event.pointerType : "touch",
+                isPrimary: isPointerEvent ? event.isPrimary : true,
+                button: -1,
+                buttons: 0,
+                ctrlKey: Boolean(event.ctrlKey),
+                altKey: Boolean(event.altKey),
+                shiftKey: Boolean(event.shiftKey),
+                metaKey: Boolean(event.metaKey)
+            });
+            setSyntheticOffset(hoverEvent, canvas, point);
+            ruffleAndroidLastPointerHoverMs = now;
+            canvas.dispatchEvent(hoverEvent);
+        }
+
+        function installRuffleAndroidClickCapture() {
+            const canvas = ruffleAndroidCanvas();
+            if (!canvas || canvas === ruffleAndroidClickCaptureTarget) {
+                return;
+            }
+
+            ruffleAndroidClickCaptureTarget = canvas;
+            androidLog("WebView click capture installed");
+            for (const eventName of ruffleAndroidClickEvents) {
+                canvas.addEventListener(eventName, stopRuffleAndroidClick, {
+                    capture: true,
+                    passive: false
+                });
+            }
+        }
+
+        function stopRuffleAndroidClick(event) {
+            if (!ruffleAndroidClickDisabled) {
+                return;
+            }
+            installRuffleAndroidClickCapture();
+            synthesizeRuffleAndroidHover(event);
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+
+        window.setRuffleAndroidClickDisabled = (enabled) => {
+            ruffleAndroidClickDisabled = Boolean(enabled);
+            androidLog("WebView click disabled: " + ruffleAndroidClickDisabled);
+        };
+
+        for (const eventName of ruffleAndroidClickEvents) {
+            window.addEventListener(eventName, stopRuffleAndroidClick, {
+                capture: true,
+                passive: false
+            });
+        }
+
+        function verifyLocalStorage() {
+            try {
+                const key = "__ruffle_android_storage_test";
+                window.localStorage.setItem(key, "1");
+                window.localStorage.removeItem(key);
+            } catch (error) {
+                androidLog(
+                    "WebView localStorage unavailable: " +
+                        (error && error.message ? error.message : error)
+                );
+            }
+        }
+
+        window.ruffleAndroidCallback = sendExternal;
+        window.SeerAndroidCallback = sendExternal;
+        window.TaomeeAndroidCallback = sendExternal;
+        window.external = window.external || {};
+        window.external.call = sendExternal;
+
+        window.addEventListener("error", (event) => {
+            androidLog(event.message || "Unknown WebView renderer error");
+        });
+        window.addEventListener("unhandledrejection", (event) => {
+            androidLog(event.reason || "Unhandled WebView renderer rejection");
+        });
+    </script>
+    <script src="./ruffle.js"></script>
+</head>
+<body>
+    <div id="container">
+        <div id="viewport">
+            <div id="stage"></div>
+        </div>
+    </div>
+    <script>
+        function fail(message) {
+            androidLog(message);
+            if (window.RuffleAndroid && window.RuffleAndroid.showLoadFailure) {
+                window.RuffleAndroid.showLoadFailure(String(message));
+            }
+        }
+
+        function baseUrlFor(movieUrl) {
+            try {
+                return new URL(".", movieUrl).href;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        const STAGE_WIDTH = 1200;
+        const STAGE_HEIGHT = 660;
+
+        function fitStage() {
+            const container = document.getElementById("container");
+            const viewport = document.getElementById("viewport");
+            const stage = document.getElementById("stage");
+            const bounds = container.getBoundingClientRect();
+            const scale = Math.max(
+                0.01,
+                Math.min(bounds.width / STAGE_WIDTH, bounds.height / STAGE_HEIGHT)
+            );
+            viewport.style.width = Math.max(1, Math.round(STAGE_WIDTH * scale)) + "px";
+            viewport.style.height = Math.max(1, Math.round(STAGE_HEIGHT * scale)) + "px";
+            stage.style.transform = "scale(" + scale + ")";
+        }
+
+        function preparePlayer(player) {
+            player.setAttribute("width", String(STAGE_WIDTH));
+            player.setAttribute("height", String(STAGE_HEIGHT));
+            player.style.width = STAGE_WIDTH + "px";
+            player.style.height = STAGE_HEIGHT + "px";
+        }
+
+        window.addEventListener("DOMContentLoaded", async () => {
+            verifyLocalStorage();
+            const movieUrl = new URLSearchParams(window.location.search).get("swf");
+            if (!movieUrl) {
+                fail("Missing SWF URL for WebView renderer");
+                return;
+            }
+
+            try {
+                const ruffle = window.RufflePlayer.newest();
+                const player = ruffle.createPlayer();
+                player.setAttribute("tabindex", "0");
+                preparePlayer(player);
+                document.getElementById("stage").appendChild(player);
+                installRuffleAndroidClickCapture();
+                fitStage();
+                window.addEventListener("resize", fitStage);
+                player.addEventListener("loadedmetadata", fitStage);
+                player.focus();
+
+                const loadOptions = {
+                    url: movieUrl,
+                    allowScriptAccess: true,
+                    httpProxy: [
+                        {
+                            origin: "*",
+                            proxyUrl: "./webview-http-proxy"
+                        }
+                    ],
+                    socketProxy: [
+                        {
+                            host: "*",
+                            port: 0,
+                            proxyUrl: "ws://" + window.location.host + "/seer2/webview-socket-proxy"
+                        }
+                    ]
+                };
+                const baseUrl = baseUrlFor(movieUrl);
+                if (baseUrl) {
+                    loadOptions.base = baseUrl;
+                }
+                await player.ruffle().load(loadOptions);
+                installRuffleAndroidClickCapture();
+                androidLog("Loaded SWF in WebView renderer: " + movieUrl);
+            } catch (error) {
+                fail("WebView renderer failed: " + (error && error.message ? error.message : error));
+            }
+        });
+    </script>
+</body>
+</html>

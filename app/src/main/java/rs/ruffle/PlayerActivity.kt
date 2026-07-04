@@ -19,6 +19,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.text.InputType
 import android.text.TextUtils
+import android.util.Base64
 import android.util.Log
 import android.util.TypedValue
 import android.view.KeyEvent
@@ -35,7 +36,9 @@ import android.view.inputmethod.ExtractedText
 import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -63,20 +66,14 @@ class PlayerActivity : GameActivity() {
     private enum class RenderBackend(val key: String, val label: String) {
         AUTO("auto", "自动"),
         VULKAN("vulkan", "Vulkan"),
-        OPENGL("opengl", "OpenGL ES")
+        OPENGL("opengl", "OpenGL ES"),
+        WEBVIEW("webview", "WebView")
     }
 
     private enum class RenderScale(val key: String, val label: String, val value: Float) {
         NATIVE("1.0", "100%", 1.0f),
         BALANCED("0.75", "75%", 0.75f),
         PERFORMANCE("0.5", "50%", 0.5f)
-    }
-
-    private enum class StageQuality(val key: String, val label: String) {
-        BEST("best", "\u6700\u9ad8"),
-        HIGH("high", "\u9ad8"),
-        MEDIUM("medium", "\u4e2d"),
-        LOW("low", "\u4f4e")
     }
 
     @Suppress("unused")
@@ -121,7 +118,6 @@ class PlayerActivity : GameActivity() {
     private external fun keyup(keyTag: String)
     private external fun commitText(text: String)
     private external fun deleteBackward(repeatCount: Int)
-    private external fun setStageQuality(key: String)
     private external fun requestContextMenu()
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
@@ -136,14 +132,18 @@ class PlayerActivity : GameActivity() {
     private lateinit var versionView: TextView
     private lateinit var renderBackendButton: TextView
     private lateinit var renderScaleButton: TextView
-    private lateinit var stageQualityButton: TextView
     private lateinit var hoverClickButton: TextView
+    private lateinit var hideControlsButton: TextView
     private lateinit var noMovieBackgroundView: View
+    private val hideableControls = mutableListOf<View>()
     private var webLoginDialog: AlertDialog? = null
     private var webLoginView: WebView? = null
+    private var webRendererView: WebView? = null
+    private var webRendererPageUrl: String? = null
     private var imeWasVisible = false
     private var consumeImeDismissTouch = false
     private var hoverClickModeEnabled = false
+    private var controlsHidden = false
     private val runtimeMetricsHandler = Handler(Looper.getMainLooper())
     private var lastRuntimeMetricsRealtimeMs = 0L
     private var lastRuntimeMetricsCpuMs = 0L
@@ -170,7 +170,7 @@ class PlayerActivity : GameActivity() {
     }
 
     private fun currentRenderScale(): RenderScale {
-        if (currentRenderBackend() == RenderBackend.OPENGL) {
+        if (currentRenderBackend().forcesNativeRenderScale()) {
             return RenderScale.NATIVE
         }
         val key = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -179,17 +179,18 @@ class PlayerActivity : GameActivity() {
     }
 
     private fun availableRenderScales(): List<RenderScale> =
-        if (currentRenderBackend() == RenderBackend.OPENGL) {
+        if (currentRenderBackend().forcesNativeRenderScale()) {
             listOf(RenderScale.NATIVE)
         } else {
             RenderScale.values().toList()
         }
 
-    private fun currentStageQuality(): StageQuality {
-        val key = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(KEY_STAGE_QUALITY, StageQuality.HIGH.key)
-        return StageQuality.values().firstOrNull { it.key == key } ?: StageQuality.HIGH
-    }
+    private fun RenderBackend.forcesNativeRenderScale(): Boolean =
+        this == RenderBackend.OPENGL || this == RenderBackend.WEBVIEW
+
+    private fun currentControlsHidden(): Boolean =
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_CONTROLS_HIDDEN, false)
 
     @Suppress("unused")
     // Used by Rust
@@ -198,10 +199,6 @@ class PlayerActivity : GameActivity() {
     @Suppress("unused")
     // Used by Rust
     private fun getRenderScale(): Float = currentRenderScale().value
-
-    @Suppress("unused")
-    // Used by Rust
-    private fun getStageQuality(): String = currentStageQuality().key
 
     @Suppress("unused")
     // Used by Rust
@@ -305,6 +302,15 @@ class PlayerActivity : GameActivity() {
                 return@runOnUiThread
             }
             noMovieBackgroundView.visibility = if (visible) View.VISIBLE else View.GONE
+        }
+    }
+
+    @Suppress("unused")
+    // Used by Rust
+    private fun showWebRenderer(pageUrl: String) {
+        runOnUiThread {
+            webRendererPageUrl = pageUrl
+            loadWebRenderer(pageUrl)
         }
     }
 
@@ -440,6 +446,158 @@ class PlayerActivity : GameActivity() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWebRendererView(): WebView = WebView(this).apply {
+        id = View.generateViewId()
+        contentDescription = "Ruffle WebView Player"
+        setBackgroundColor(Color.BLACK)
+        isFocusable = true
+        isFocusableInTouchMode = true
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.databaseEnabled = true
+        settings.cacheMode = WebSettings.LOAD_DEFAULT
+        settings.mediaPlaybackRequiresUserGesture = false
+        settings.allowFileAccess = true
+        settings.allowContentAccess = true
+        settings.allowFileAccessFromFileURLs = true
+        settings.allowUniversalAccessFromFileURLs = true
+        if (Build.VERSION.SDK_INT >= VERSION_CODES.LOLLIPOP) {
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        }
+        addJavascriptInterface(WebRendererBridge(), "RuffleAndroid")
+        addJavascriptInterface(WebRendererStorageBridge(), "RuffleAndroidStorage")
+        webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                Log.i(
+                    "ruffle-webview",
+                    "${consoleMessage.message()} " +
+                        "(${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})"
+                )
+                return true
+            }
+        }
+        webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: WebResourceRequest
+            ): Boolean {
+                Log.i("ruffle-webview", "Navigating: ${request.url}")
+                return false
+            }
+
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
+                Log.i("ruffle-webview", "Navigating: $url")
+                return false
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                updateWebRendererClickMode()
+            }
+        }
+    }
+
+    private fun loadWebRenderer(pageUrl: String) {
+        val webView = webRendererView ?: return
+        if (currentRenderBackend() != RenderBackend.WEBVIEW) {
+            return
+        }
+        Log.i("ruffle", "Loading WebView renderer: $pageUrl")
+        webView.loadUrl(pageUrl)
+        webView.requestFocus()
+        updateWebRendererClickMode()
+    }
+
+    private fun updateWebRendererClickMode() {
+        val enabled = if (hoverClickModeEnabled) "true" else "false"
+        webRendererView?.evaluateJavascript(
+            "window.setRuffleAndroidClickDisabled && " +
+                "window.setRuffleAndroidClickDisabled($enabled);",
+            null
+        )
+    }
+
+    private inner class WebRendererBridge {
+        @JavascriptInterface
+        fun postMessage(name: String, payload: String?) {
+            Log.i("ruffle-webview", "ExternalInterface name=$name payload=${payload ?: ""}")
+        }
+
+        @JavascriptInterface
+        fun log(message: String) {
+            Log.i("ruffle-webview", message)
+        }
+
+        @JavascriptInterface
+        fun showLoadFailure(message: String) {
+            this@PlayerActivity.showLoadFailure(message)
+        }
+    }
+
+    private inner class WebRendererStorageBridge {
+        @JavascriptInterface
+        fun get(name: String): String? {
+            val file = sharedObjectFile(name) ?: return null
+            return try {
+                if (file.isFile) {
+                    Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+                } else {
+                    null
+                }
+            } catch (error: Exception) {
+                Log.w("ruffle-webview", "SharedObject read failed: $name", error)
+                null
+            }
+        }
+
+        @JavascriptInterface
+        fun put(name: String, valueBase64: String): Boolean {
+            val file = sharedObjectFile(name) ?: return false
+            return try {
+                val bytes = Base64.decode(valueBase64, Base64.DEFAULT)
+                file.parentFile?.mkdirs()
+                file.writeBytes(bytes)
+                true
+            } catch (error: Exception) {
+                Log.w("ruffle-webview", "SharedObject write failed: $name", error)
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun remove(name: String) {
+            val file = sharedObjectFile(name) ?: return
+            try {
+                file.delete()
+            } catch (error: Exception) {
+                Log.w("ruffle-webview", "SharedObject remove failed: $name", error)
+            }
+        }
+    }
+
+    private fun sharedObjectFile(name: String): File? {
+        val root = sharedObjectStorageRoot().canonicalFile
+        val file = File(root, "$name.sol").canonicalFile
+        val rootPath = root.path + File.separator
+        return if (file.path.startsWith(rootPath)) {
+            file
+        } else {
+            Log.w("ruffle-webview", "Rejected SharedObject path: $name")
+            null
+        }
+    }
+
+    private fun sharedObjectStorageRoot(): File {
+        val storageDir = File(filesDir, "ruffle/shared_objects")
+        if (!storageDir.exists()) {
+            storageDir.mkdirs()
+        }
+        return storageDir
+    }
+
     override fun onCreateSurfaceView() {
         val inflater = layoutInflater
 
@@ -449,6 +607,8 @@ class PlayerActivity : GameActivity() {
         contentViewId = View.generateViewId()
         layout.id = contentViewId
         setContentView(layout)
+        hideableControls.clear()
+        controlsHidden = currentControlsHidden()
         mSurfaceView = InputEnabledSurfaceView(this)
         ruffleInputView = RuffleInputView(this)
 
@@ -480,6 +640,16 @@ class PlayerActivity : GameActivity() {
         parent.removeView(placeholder)
         parent.addView(mSurfaceView, index)
         mSurfaceView.setLayoutParams(pars)
+        if (currentRenderBackend() == RenderBackend.WEBVIEW) {
+            mSurfaceView.visibility = View.INVISIBLE
+            mSurfaceView.isFocusable = false
+            mSurfaceView.isFocusableInTouchMode = false
+            webRendererView = createWebRendererView().also { webView ->
+                parent.addView(webView, index + 1)
+                webView.layoutParams = ConstraintLayout.LayoutParams(pars)
+                webRendererPageUrl?.let { loadWebRenderer(it) }
+            }
+        }
         layout.addView(
             ruffleInputView,
             ConstraintLayout.LayoutParams(1, 1).apply {
@@ -544,6 +714,7 @@ class PlayerActivity : GameActivity() {
                 bottomMargin = dp(8)
             }
         )
+        hideableControls.add(diagnosticOverlay)
         val customMovieButton = TextView(this).apply {
             id = View.generateViewId()
             text = "\u64ad\u653e\u81ea\u5b9a\u4e49"
@@ -558,6 +729,7 @@ class PlayerActivity : GameActivity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             setOnClickListener { showCustomMovieDialog() }
         }
+        hideableControls.add(customMovieButton)
         layout.addView(
             customMovieButton,
             ConstraintLayout.LayoutParams(
@@ -584,6 +756,7 @@ class PlayerActivity : GameActivity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             setOnClickListener { showRenderBackendMenu() }
         }
+        hideableControls.add(renderBackendButton)
         layout.addView(
             renderBackendButton,
             ConstraintLayout.LayoutParams(
@@ -610,6 +783,7 @@ class PlayerActivity : GameActivity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             setOnClickListener { showRenderScaleMenu() }
         }
+        hideableControls.add(renderScaleButton)
         layout.addView(
             renderScaleButton,
             ConstraintLayout.LayoutParams(
@@ -618,32 +792,6 @@ class PlayerActivity : GameActivity() {
             ).apply {
                 startToStart = ConstraintLayout.LayoutParams.PARENT_ID
                 topToBottom = renderBackendButton.id
-                marginStart = dp(8)
-                topMargin = dp(6)
-            }
-        )
-        stageQualityButton = TextView(this).apply {
-            id = View.generateViewId()
-            text = stageQualityButtonText(currentStageQuality())
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.TRANSPARENT)
-            typeface = Typeface.DEFAULT_BOLD
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            includeFontPadding = false
-            setPadding(dp(8), dp(5), dp(8), dp(5))
-            isClickable = true
-            isFocusable = false
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            setOnClickListener { showStageQualityMenu() }
-        }
-        layout.addView(
-            stageQualityButton,
-            ConstraintLayout.LayoutParams(
-                ConstraintLayout.LayoutParams.WRAP_CONTENT,
-                ConstraintLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                startToStart = ConstraintLayout.LayoutParams.PARENT_ID
-                topToBottom = renderScaleButton.id
                 marginStart = dp(8)
                 topMargin = dp(6)
             }
@@ -674,6 +822,8 @@ class PlayerActivity : GameActivity() {
         }
         layout.findViewById<View>(R.id.button_cm)
             .setOnClickListener { requestContextMenu() }
+        hideableControls.add(layout.findViewById(R.id.keyboard))
+        hideableControls.add(layout.findViewById(R.id.toolbar))
         updateOverlayVisibility(resources.configuration)
         layout.requestLayout()
         mSurfaceView.requestFocus()
@@ -696,16 +846,91 @@ class PlayerActivity : GameActivity() {
         val toolbar = findViewById<View>(R.id.toolbar) ?: return
         val isLandscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
         val visibility = if (isLandscape) View.GONE else View.VISIBLE
-        keyboard.visibility = visibility
-        toolbar.visibility = visibility
+        if (controlsHidden) {
+            keyboard.visibility = View.GONE
+            toolbar.visibility = View.GONE
+        } else {
+            keyboard.visibility = visibility
+            toolbar.visibility = visibility
+        }
+        applyControlsVisibility(animate = false)
+    }
+
+    private fun toggleControlsHidden() {
+        controlsHidden = !controlsHidden
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_CONTROLS_HIDDEN, controlsHidden)
+            .apply()
+        updateHideControlsButton()
+        applyControlsVisibility(animate = true)
+    }
+
+    private fun updateHideControlsButton() {
+        if (!::hideControlsButton.isInitialized) {
+            return
+        }
+        hideControlsButton.text = if (controlsHidden) "显示" else "隐藏"
+        hideControlsButton.setBackgroundColor(
+            if (controlsHidden) {
+                0x55FFFFFF
+            } else {
+                Color.TRANSPARENT
+            }
+        )
+    }
+
+    private fun applyControlsVisibility(animate: Boolean) {
+        hideableControls.forEach { view ->
+            val targetVisibility = targetControlVisibility(view)
+            view.animate().cancel()
+            if (!animate) {
+                view.alpha = if (targetVisibility == View.VISIBLE) 1f else 0f
+                view.visibility = targetVisibility
+                return@forEach
+            }
+            if (targetVisibility == View.VISIBLE) {
+                view.visibility = View.VISIBLE
+                view.alpha = 0f
+                view.animate()
+                    .alpha(1f)
+                    .setDuration(CONTROLS_ANIMATION_MS)
+                    .start()
+            } else {
+                view.animate()
+                    .alpha(0f)
+                    .setDuration(CONTROLS_ANIMATION_MS)
+                    .withEndAction {
+                        if (controlsHidden) {
+                            view.visibility = View.GONE
+                        }
+                    }
+                    .start()
+            }
+        }
+    }
+
+    private fun targetControlVisibility(view: View): Int {
+        if (controlsHidden) {
+            return View.GONE
+        }
+        return if (
+            view.id == R.id.keyboard ||
+            view.id == R.id.toolbar
+        ) {
+            if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                View.GONE
+            } else {
+                View.VISIBLE
+            }
+        } else {
+            View.VISIBLE
+        }
     }
 
     private fun renderBackendButtonText(backend: RenderBackend): String = "GPU:${backend.label}"
 
     private fun renderScaleButtonText(scale: RenderScale): String = "分辨率:${scale.label}"
-
-    private fun stageQualityButtonText(quality: StageQuality): String =
-        "\u753b\u8d28:${quality.label}"
 
     private fun showCustomMovieDialog() {
         val recentUrls = recentCustomMovieUrls()
@@ -907,34 +1132,6 @@ class PlayerActivity : GameActivity() {
             .show()
     }
 
-    private fun showStageQualityMenu() {
-        val current = currentStageQuality()
-        val popup = PopupMenu(this, stageQualityButton)
-        StageQuality.values().forEachIndexed { index, quality ->
-            val item = popup.menu.add(Menu.NONE, index, index, quality.label)
-            item.isCheckable = true
-            item.isChecked = quality == current
-        }
-        popup.setOnMenuItemClickListener { item ->
-            val selected = StageQuality.values().getOrNull(item.itemId)
-                ?: return@setOnMenuItemClickListener true
-            if (selected != currentStageQuality()) {
-                applyStageQuality(selected)
-            }
-            true
-        }
-        popup.show()
-    }
-
-    private fun applyStageQuality(quality: StageQuality) {
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_STAGE_QUALITY, quality.key)
-            .apply()
-        stageQualityButton.text = stageQualityButtonText(quality)
-        setStageQuality(quality.key)
-    }
-
     private fun confirmExit() {
         AlertDialog.Builder(this)
             .setTitle("退出游戏")
@@ -1062,7 +1259,7 @@ class PlayerActivity : GameActivity() {
         ruffleInputView.clearFocus()
         ruffleInputView.isFocusable = false
         ruffleInputView.isFocusableInTouchMode = false
-        mSurfaceView.requestFocus()
+        requestRenderFocusIfReady()
     }
 
     private fun updateServerMetricsBottomMargin(bottomInset: Int) {
@@ -1179,9 +1376,24 @@ class PlayerActivity : GameActivity() {
             orientation = LinearLayout.VERTICAL
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        container.addView(actionButton("刷新") { confirmRefresh() })
+        val refreshButton = actionButton("刷新") { confirmRefresh() }
+        hideableControls.add(refreshButton)
+        container.addView(refreshButton)
+        val exitButton = actionButton("退出") { confirmExit() }
+        hideableControls.add(exitButton)
         container.addView(
-            actionButton("退出") { confirmExit() },
+            exitButton,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8)
+            }
+        )
+        hideControlsButton = actionButton("隐藏") { toggleControlsHidden() }
+        updateHideControlsButton()
+        container.addView(
+            hideControlsButton,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1218,6 +1430,7 @@ class PlayerActivity : GameActivity() {
             setOnClickListener {
                 hoverClickModeEnabled = !hoverClickModeEnabled
                 setHoverClickMode(hoverClickModeEnabled)
+                updateWebRendererClickMode()
                 updateHoverClickButton()
             }
         }
@@ -1229,7 +1442,7 @@ class PlayerActivity : GameActivity() {
                 ConstraintLayout.LayoutParams.WRAP_CONTENT
             ).apply {
                 startToStart = ConstraintLayout.LayoutParams.PARENT_ID
-                topToBottom = stageQualityButton.id
+                topToBottom = renderScaleButton.id
                 marginStart = dp(8)
                 topMargin = dp(34)
             }
@@ -1289,7 +1502,7 @@ class PlayerActivity : GameActivity() {
         notice.bringToFront()
         Handler(Looper.getMainLooper()).postDelayed({
             notice.visibility = View.GONE
-            requestSurfaceFocusIfReady()
+            requestRenderFocusIfReady()
         }, HEALTH_NOTICE_MS)
     }
 
@@ -1527,7 +1740,7 @@ class PlayerActivity : GameActivity() {
     override fun onResume() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        requestSurfaceFocusIfReady()
+        requestRenderFocusIfReady()
     }
 
     override fun onPause() {
@@ -1537,6 +1750,8 @@ class PlayerActivity : GameActivity() {
 
     override fun onDestroy() {
         stopRuntimeMetricsOverlay()
+        webRendererView?.destroy()
+        webRendererView = null
         if (isFinishing) {
             KeepAliveService.stop(this)
         }
@@ -1568,19 +1783,27 @@ class PlayerActivity : GameActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
-            requestSurfaceFocusIfReady()
+            requestRenderFocusIfReady()
         }
     }
 
     private fun shouldDispatchHardwareKeyToRuffle(): Boolean {
-        if (mSurfaceView == null || webLoginDialog?.isShowing == true) {
+        if (
+            mSurfaceView == null ||
+            webLoginDialog?.isShowing == true ||
+            currentRenderBackend() == RenderBackend.WEBVIEW
+        ) {
             return false
         }
         return currentFocus !is EditText
     }
 
-    private fun requestSurfaceFocusIfReady() {
-        mSurfaceView?.requestFocus()
+    private fun requestRenderFocusIfReady() {
+        if (currentRenderBackend() == RenderBackend.WEBVIEW) {
+            webRendererView?.requestFocus()
+        } else {
+            mSurfaceView?.requestFocus()
+        }
     }
 
     private fun dispatchHardwareKeyToRuffle(event: KeyEvent): Boolean {
@@ -1705,13 +1928,14 @@ class PlayerActivity : GameActivity() {
         private const val PREFS_NAME = "ruffle_settings"
         private const val KEY_RENDER_BACKEND = "render_backend"
         private const val KEY_RENDER_SCALE = "render_scale"
-        private const val KEY_STAGE_QUALITY = "stage_quality"
+        private const val KEY_CONTROLS_HIDDEN = "controls_hidden"
         private const val KEY_CUSTOM_MOVIE_URLS = "custom_movie_urls"
         private const val EXTRA_SWF_URI = "swfUri"
         private const val CRASH_PREFS_NAME = "crash_logs"
         private const val KEY_PENDING_CRASH = "pending_native_panic"
         private const val HEALTH_NOTICE_MS = 1000L
         private const val RUNTIME_METRICS_INTERVAL_MS = 1000L
+        private const val CONTROLS_ANIMATION_MS = 180L
         private const val IME_DELETE_SENTINEL = "\u200b"
         private const val MAX_IME_DELETE_REPEAT = 8
         private const val MAX_IME_SHADOW_CHARS = 64

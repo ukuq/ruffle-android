@@ -98,6 +98,7 @@ enum RenderBackendPreference {
     Auto,
     Vulkan,
     OpenGl,
+    WebView,
 }
 
 impl RenderBackendPreference {
@@ -105,6 +106,7 @@ impl RenderBackendPreference {
         match key {
             "auto" => Self::Auto,
             "opengl" => Self::OpenGl,
+            "webview" => Self::WebView,
             _ => Self::Vulkan,
         }
     }
@@ -114,6 +116,7 @@ impl RenderBackendPreference {
             Self::Auto => "auto",
             Self::Vulkan => "vulkan",
             Self::OpenGl => "opengl",
+            Self::WebView => "webview",
         }
     }
 
@@ -122,16 +125,8 @@ impl RenderBackendPreference {
             Self::Auto => wgpu::Backends::PRIMARY,
             Self::Vulkan => wgpu::Backends::VULKAN,
             Self::OpenGl => wgpu::Backends::GL,
+            Self::WebView => wgpu::Backends::empty(),
         }
-    }
-}
-
-fn stage_quality_from_key(key: &str) -> StageQuality {
-    match key {
-        "low" => StageQuality::Low,
-        "medium" => StageQuality::Medium,
-        "best" => StageQuality::Best,
-        _ => StageQuality::High,
     }
 }
 
@@ -635,7 +630,7 @@ async fn run(app: AndroidApp) {
     let android_app_data_dir;
     let render_backend;
     let render_scale;
-    let mut stage_quality;
+    let stage_quality = StageQuality::High;
     let mut hover_click_mode = false;
 
     unsafe {
@@ -652,8 +647,6 @@ async fn run(app: AndroidApp) {
         ));
         render_scale =
             sanitize_render_scale(JavaInterface::get_render_scale(&mut jni_env, &activity));
-        stage_quality =
-            stage_quality_from_key(&JavaInterface::get_stage_quality(&mut jni_env, &activity));
         let _ = jni_env.set_rust_field(activity, "eventLoopHandle", sender.clone());
     }
     log::info!("Render backend preference: {}", render_backend.key());
@@ -663,13 +656,14 @@ async fn run(app: AndroidApp) {
             "OpenGL ES backend requires native Android surface size; resolution scale will be ignored"
         );
     }
-    log::info!("Stage quality: {stage_quality}");
 
     let external_movie_url = swf_uri.filter(|uri| !uri.is_empty());
     if let Some(uri) = external_movie_url.as_ref() {
         log::info!("Loading movie from Android intent: {uri}");
     }
-    let seer2_server = if external_movie_url.is_some() {
+    let needs_local_server =
+        external_movie_url.is_none() || render_backend == RenderBackendPreference::WebView;
+    let seer2_server = if !needs_local_server {
         None
     } else {
         let load_failure_notifier: seer2::LoadFailureNotifier =
@@ -689,6 +683,13 @@ async fn run(app: AndroidApp) {
     };
     let root_movie_url =
         external_movie_url.or_else(|| seer2_server.as_ref().map(|server| server.movie_url()));
+    if render_backend == RenderBackendPreference::WebView {
+        if let (Some(server), Some(movie_url)) = (seer2_server.as_ref(), root_movie_url.as_ref()) {
+            show_web_renderer(&server.web_renderer_url(movie_url));
+        } else {
+            log::warn!("Root movie URL is unavailable; WebView renderer not started");
+        }
+    }
     if let Some(server) = seer2_server.as_ref() {
         start_server_metrics_overlay(server.metrics(), server.shutdown_token());
     }
@@ -787,7 +788,9 @@ async fn run(app: AndroidApp) {
                             playerbox.is_some()
                         );
 
-                        if let Some(activeplayer) = &playerbox {
+                        if render_backend == RenderBackendPreference::WebView {
+                            log::info!("Init window handled by WebView renderer");
+                        } else if let Some(activeplayer) = &playerbox {
                             last_frame_time = Instant::now();
                             next_frame_time = Some(last_frame_time);
                             surface_attached = recreate_player_surface(
@@ -1054,17 +1057,6 @@ async fn run(app: AndroidApp) {
                         }
                     }
                 }
-                RuffleEvent::SetStageQuality(quality) => {
-                    stage_quality = quality;
-                    if let Some(player) = playerbox.as_ref() {
-                        if let Ok(mut player) = player.player.lock() {
-                            player.set_quality(quality);
-                            needs_redraw = true;
-                        } else {
-                            log::warn!("Skipping stage quality change; player lock is poisoned");
-                        }
-                    }
-                }
                 RuffleEvent::RunContextMenuCallback(index) => {
                     if let Some(player) = playerbox.as_ref() {
                         if let Ok(mut player) = player.player.lock() {
@@ -1245,31 +1237,6 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_deleteBackward(
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setStageQuality(
-    mut env: JNIEnv,
-    this: JObject,
-    key: JString,
-) {
-    let key: String = match env.get_string(&key) {
-        Ok(key) => key.into(),
-        Err(error) => {
-            log::warn!("Ignoring stage quality change; failed to read Java string: {error}");
-            return;
-        }
-    };
-
-    let event_loop: Result<MutexGuard<EventSender>, _> =
-        env.get_rust_field(this, "eventLoopHandle");
-    match event_loop {
-        Ok(event_loop) => {
-            event_loop.send(RuffleEvent::SetStageQuality(stage_quality_from_key(&key)))
-        }
-        Err(error) => log::warn!("Ignoring stage quality change before event loop: {error:?}"),
-    }
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydown(
     mut env: JNIEnv,
     this: JObject,
@@ -1353,6 +1320,16 @@ fn show_load_failure(message: &str) {
     }
 }
 
+fn show_web_renderer(movie_url: &str) {
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => JavaInterface::show_web_renderer(&mut env, &activity, movie_url),
+            Err(error) => log::warn!("Skipping WebView renderer; JVM attach failed: {error}"),
+        },
+        Err(error) => log::warn!("Skipping WebView renderer; JVM unavailable: {error}"),
+    }
+}
+
 pub(crate) fn open_web_login_url(url: &str) {
     match get_jvm() {
         Ok((jvm, activity)) => match jvm.attach_current_thread() {
@@ -1419,7 +1396,7 @@ fn sanitize_render_scale(scale: f32) -> f64 {
 
 fn effective_render_scale(render_backend: RenderBackendPreference, render_scale: f64) -> f64 {
     match render_backend {
-        RenderBackendPreference::OpenGl => 1.0,
+        RenderBackendPreference::OpenGl | RenderBackendPreference::WebView => 1.0,
         RenderBackendPreference::Auto | RenderBackendPreference::Vulkan => render_scale,
     }
 }
