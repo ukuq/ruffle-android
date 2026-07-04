@@ -13,7 +13,55 @@ env:
   CARGO_NDK_VERSION: "4.1.2"
 
 jobs:
+  build-ruffle-selfhosted:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout Ruffle dependency
+        run: |
+          rm -rf ../ruffle
+          git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.120 --locked
+
+      - name: Build Ruffle selfhosted
+        run: bash .github/scripts/build-ruffle-selfhosted.sh
+
+      - name: Stage Ruffle selfhosted dist
+        run: |
+          mkdir -p ruffle-selfhosted-dist
+          cp -r ../ruffle/web/packages/selfhosted/dist/. ruffle-selfhosted-dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ruffle-selfhosted-dist
+          path: ruffle-selfhosted-dist
+
   build-native-libs:
+    needs: build-ruffle-selfhosted
     runs-on: ubuntu-latest
 
     strategy:
@@ -38,6 +86,28 @@ jobs:
         run: |
           rm -rf ../ruffle
           git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ruffle-selfhosted-dist
+          path: ruffle-selfhosted-dist
+
+      - name: Install Ruffle selfhosted dist
+        run: |
+          rm -rf ../ruffle/web/packages/selfhosted/dist
+          mkdir -p ../ruffle/web/packages/selfhosted/dist
+          cp -r ruffle-selfhosted-dist/. ../ruffle/web/packages/selfhosted/dist/
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
 
       - name: Install Rust toolchain
         run: |

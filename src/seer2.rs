@@ -28,24 +28,34 @@ const WEBVIEW_HTTP_PROXY_PATH: &str = "/seer2/webview-http-proxy";
 const WEBVIEW_SOCKET_PROXY_PATH: &str = "/seer2/webview-socket-proxy";
 const RUFFLE_JS_PATH: &str = "/seer2/ruffle.js";
 const RUFFLE_JS_MAP_PATH: &str = "/seer2/ruffle.js.map";
-const RUFFLE_CORE_JS_PATH: &str = "/seer2/core.ruffle.f9ef39952cb0d30efac2.js";
-const RUFFLE_CORE_JS_MAP_PATH: &str = "/seer2/core.ruffle.f9ef39952cb0d30efac2.js.map";
-const RUFFLE_WASM_PATH: &str = "/seer2/32aa5c0c6453ffd9ea2e.wasm";
+const RUFFLE_CORE_JS_PATH: &str = concat!("/seer2/", env!("RUFFLE_CORE_JS_FILE"));
+const RUFFLE_CORE_JS_MAP_PATH: &str = concat!("/seer2/", env!("RUFFLE_CORE_JS_MAP_FILE"));
+const RUFFLE_WASM_PATH: &str = concat!("/seer2/", env!("RUFFLE_WASM_FILE"));
 const MAX_LOCAL_CONNECTIONS: usize = 64;
 const MAX_WEBSOCKET_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const LOAD_FAILED_PREFIX: &str =
     "\u{6e38}\u{620f}\u{52a0}\u{8f7d}\u{5931}\u{8d25}\u{ff0c}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{540e}\u{91cd}\u{8bd5}\u{3002}";
 const WEBVIEW_RENDERER_HTML: &[u8] = include_bytes!("../app/src/main/assets/webview-renderer.html");
-const RUFFLE_JS: &[u8] = include_bytes!("../../ruffle/web/packages/selfhosted/dist/ruffle.js");
-const RUFFLE_JS_MAP: &[u8] =
-    include_bytes!("../../ruffle/web/packages/selfhosted/dist/ruffle.js.map");
-const RUFFLE_CORE_JS: &[u8] =
-    include_bytes!("../../ruffle/web/packages/selfhosted/dist/core.ruffle.f9ef39952cb0d30efac2.js");
-const RUFFLE_CORE_JS_MAP: &[u8] = include_bytes!(
-    "../../ruffle/web/packages/selfhosted/dist/core.ruffle.f9ef39952cb0d30efac2.js.map"
-);
-const RUFFLE_WASM: &[u8] =
-    include_bytes!("../../ruffle/web/packages/selfhosted/dist/32aa5c0c6453ffd9ea2e.wasm");
+const RUFFLE_JS: &[u8] = include_bytes!(concat!(env!("RUFFLE_SELFHOSTED_DIST_DIR"), "/ruffle.js"));
+const RUFFLE_JS_MAP: &[u8] = include_bytes!(concat!(
+    env!("RUFFLE_SELFHOSTED_DIST_DIR"),
+    "/ruffle.js.map"
+));
+const RUFFLE_CORE_JS: &[u8] = include_bytes!(concat!(
+    env!("RUFFLE_SELFHOSTED_DIST_DIR"),
+    "/",
+    env!("RUFFLE_CORE_JS_FILE")
+));
+const RUFFLE_CORE_JS_MAP: &[u8] = include_bytes!(concat!(
+    env!("RUFFLE_SELFHOSTED_DIST_DIR"),
+    "/",
+    env!("RUFFLE_CORE_JS_MAP_FILE")
+));
+const RUFFLE_WASM: &[u8] = include_bytes!(concat!(
+    env!("RUFFLE_SELFHOSTED_DIST_DIR"),
+    "/",
+    env!("RUFFLE_WASM_FILE")
+));
 
 pub type LoadFailureNotifier = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -593,7 +603,7 @@ fn read_client_websocket_frame(stream: &mut TcpStream) -> io::Result<WebSocketFr
     }
 
     match opcode {
-        0x0 | 0x1 | 0x2 => Ok(WebSocketFrame::Data(payload)),
+        0x0..=0x2 => Ok(WebSocketFrame::Data(payload)),
         0x8 => Ok(WebSocketFrame::Close),
         0x9 => Ok(WebSocketFrame::Ping(payload)),
         0xA => Ok(WebSocketFrame::Pong),
@@ -1307,14 +1317,8 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
 
     for chunk in message.chunks_exact(64) {
         let mut words = [0_u32; 80];
-        for i in 0..16 {
-            let offset = i * 4;
-            words[i] = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
+        for (word, bytes) in words.iter_mut().take(16).zip(chunk.chunks_exact(4)) {
+            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         for i in 16..80 {
             words[i] = (words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16]).rotate_left(1);

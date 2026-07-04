@@ -27,6 +27,16 @@ jobs:
           rm -rf ../ruffle
           git clone --depth 1 --branch master1 https://github.com/ukuq/ruffle.git ../ruffle
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -36,6 +46,7 @@ jobs:
         run: |
           rustup show
           rustup target add aarch64-linux-android
+          rustup target add wasm32-unknown-unknown
           rustup component add rustfmt clippy
 
       - name: Cache Cargo output
@@ -43,6 +54,12 @@ jobs:
         with:
           shared-key: clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.120 --locked
+
+      - name: Build Ruffle selfhosted
+        run: bash .github/scripts/build-ruffle-selfhosted.sh
 
       - name: Check formatting
         run: cargo fmt --all -- --check
