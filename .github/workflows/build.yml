@@ -42,7 +42,6 @@ jobs:
       - name: Install Rust toolchain
         run: |
           rustup show
-          rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version 0.2.120 --locked
