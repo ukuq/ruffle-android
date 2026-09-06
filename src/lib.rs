@@ -29,7 +29,10 @@ use std::{
     thread,
     time::Instant,
 };
-use wgpu::rwh::{AndroidDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use wgpu::rwh::{
+    AndroidDisplayHandle, DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle,
+    RawDisplayHandle,
+};
 
 use android_activity::input::{InputEvent, KeyAction, MotionAction};
 use android_activity::{AndroidApp, AndroidAppWaker, InputStatus, MainEvent, PollEvent};
@@ -91,6 +94,15 @@ pub struct PlayerRunnable(async_task::Runnable<PlayerId>);
 struct ActivePlayer {
     id: PlayerId,
     player: Arc<Mutex<Player>>,
+}
+
+#[derive(Debug)]
+struct AndroidDisplayHandleOwner;
+
+impl HasDisplayHandle for AndroidDisplayHandleOwner {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(DisplayHandle::android())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -456,12 +468,15 @@ fn create_render_backend(
         let result = catch_recoverable_panic(|| unsafe {
             WgpuRenderBackend::for_window_unsafe(
                 wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                    raw_display_handle: Some(
+                        RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                    ),
                     raw_window_handle,
                 },
                 (dimensions.width, dimensions.height),
                 render_backend.backends(),
                 wgpu::PowerPreference::HighPerformance,
+                Some(Box::new(AndroidDisplayHandleOwner)),
             )
         });
 
@@ -529,7 +544,7 @@ fn recreate_player_surface(
     let result = catch_recoverable_panic(|| unsafe {
         renderer.recreate_surface_unsafe(
             wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                raw_display_handle: Some(RawDisplayHandle::Android(AndroidDisplayHandle::new())),
                 raw_window_handle,
             },
             render_surface_size_for_backend(window, render_backend, render_scale),

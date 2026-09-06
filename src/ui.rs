@@ -276,6 +276,7 @@ impl FontRenderer for AndroidCanvasFontRenderer {
             bitmap,
             Twips::new(advance),
             Twips::new(tx),
+            Twips::ZERO,
             has_native_color,
         ))
     }
